@@ -32,6 +32,20 @@
 #include "ckks/operator.cuh"
 #include "ckks/mpcmanager.cuh"
 
+#include "rtf/context.cuh"
+#include "rtf/secretkey.cuh"
+#include "rtf/publickey.cuh"
+#include "rtf/plaintext.cuh"
+#include "rtf/ciphertext.cuh"
+#include "rtf/evaluationkey.cuh"
+#include "rtf/encoder.cuh"
+#include "rtf/keygenerator.cuh"
+#include "rtf/encryptor.cuh"
+#include "rtf/decryptor.cuh"
+#include "rtf/operator.cuh"
+#include "rtf/mpcmanager.cuh"
+
+
 #include "tfhe/context.cuh"
 #include "tfhe/secretkey.cuh"
 #include "tfhe/ciphertext.cuh"

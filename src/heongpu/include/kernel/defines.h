@@ -14,6 +14,7 @@
 #define MAX_POLY_DEGREE 65536 // 2^16 for now!
 #define MIN_POLY_DEGREE 4096 // 2^12
 
+
 // Range of the bit-length of all user-defined modulus
 #define MAX_USER_DEFINED_MOD_BIT_COUNT 60
 #define MIN_USER_DEFINED_MOD_BIT_COUNT 30

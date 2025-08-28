@@ -14,7 +14,8 @@ namespace heongpu
     {
         BFV,
         CKKS,
-        TFHE
+        TFHE,
+        RTF
     };
 
     template <Scheme S> class Ciphertext;

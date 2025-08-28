@@ -9,7 +9,8 @@ file(GLOB_RECURSE LIB_SOURCE_FILES
     lib/host/*.cu
     lib/host/bfv/*.cu
     lib/host/ckks/*.cu
-    lib/host/tfhe/*.cu
+    lib/host/rtf/*.cu
+    # lib/host/tfhe/*.cu
     lib/kernel/*.cu
     lib/util/*.cu
     lib/util/*.cpp

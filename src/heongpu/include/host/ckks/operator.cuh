@@ -1505,6 +1505,7 @@ namespace heongpu
 
         // Double-hoisting BSGS matrix×vector algorithm
         __host__ DeviceVector<Data64>
+        
         fast_single_hoisting_rotation_ckks(Ciphertext<Scheme::CKKS>& input1,
                                            std::vector<int>& bsgs_shift, int n1,
                                            Galoiskey<Scheme::CKKS>& galois_key,
