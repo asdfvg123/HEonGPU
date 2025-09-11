@@ -5,7 +5,6 @@
 
 #include "rtf/operator.cuh"
 
-
 template <typename T>
 void display_matrix(const std::vector<T>& matrix, std::size_t row_size)
 {
@@ -629,72 +628,269 @@ namespace heongpu
 
         output.memory_set(std::move(output_memory));
     }
+
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
-        std::vector<heongpu::DeviceVector<Data64>>& matrix,   // 각 그룹별로 대각선이 연속 저장
-        std::vector<std::vector<int>>& diags,                 // diags[g] = 그 그룹의 회전량 목록
+        std::vector<heongpu::DeviceVector<Data64>>&
+            matrix, // concatenated diags
+        std::vector<std::vector<int>>& diags, // per-group rotation list
         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
         const ExecutionOptions& options)
     {
         cudaStream_t stream = options.stream_;
-        if (stream == cudaStreamDefault) {
+        if (stream == cudaStreamDefault)
             stream = cipher.stream();
+
+        ExecutionOptions opt = ExecutionOptions()
+                                   .set_stream(stream)
+                                   .set_storage_type(storage_type::DEVICE)
+                                   .set_initial_location(true);
+
+        heongpu::Ciphertext<heongpu::Scheme::RTF> ct = cipher;
+        if (ct.in_ntt_domain_)
+        {
+            transform_from_ntt_inplace(ct, opt);
+        }
+        if (ct.relinearization_required_)
+        {
+            throw std::invalid_argument("multiply_matrix: relinearize first.");
         }
 
-        heongpu::Ciphertext<heongpu::Scheme::RTF> result =
-            operator_ciphertext(0, stream);
+        const int N = static_cast<int>(n);
+
+        heongpu::Ciphertext<heongpu::Scheme::RTF> acc_ntt =
+            operator_ciphertext(stream);
         bool first_term = true;
 
-        for (size_t g = 0; g < diags.size(); ++g) {
-            const auto& shifts = diags[g];
+        for (size_t g = 0; g < diags.size(); ++g)
+        {
+            if (diags[g].empty())
+                continue;
             auto& blob = matrix[g];
-            if (shifts.empty()) continue;
 
-
-            const size_t per_diag_elems = blob.size() / shifts.size();
+            const size_t num_diags = diags[g].size(); // 16
+            const size_t per_diag_elems = blob.size() / num_diags; // must be N
+            if (per_diag_elems < static_cast<size_t>(N))
+            {
+                throw std::invalid_argument(
+                    "multiply_matrix: diagonal size too small.");
+            }
             Data64* base_ptr = blob.data();
 
-            // 대각선(회전)별 처리
-            for (size_t k = 0; k < shifts.size(); ++k) {
-                const int rot = shifts[k];
+            for (size_t k = 0; k < num_diags; ++k)
+            {
+                int rot = diags[g][k];
 
-                // 1) 회전 (BFV 회전은 intt 도메인만 허용)
-                heongpu::Ciphertext<heongpu::Scheme::RTF> rotated = cipher;
-                rotate_rows_inplace(rotated, galois_key, rot, options);
+                heongpu::Ciphertext<heongpu::Scheme::RTF> rotated = ct;
+                if (rot != 0)
+                {
+                    rotate_rows_inplace(rotated, galois_key, rot, opt);
+                }
 
-                // 2) 대각선 plaintext 구성: 디폴트 생성 후 memory_set으로 디바이스 버퍼 채우기
-                heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag; 
+                // Load this diagonal (coeff domain)
+                heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
+                {
+                    const size_t diag_len = static_cast<size_t>(N);
+                    heongpu::DeviceVector<Data64> tmp(diag_len, stream);
 
-                heongpu::DeviceVector<Data64> tmp(per_diag_elems, stream);
-                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                    tmp.data(),
-                    base_ptr + k * per_diag_elems,
-                    per_diag_elems * sizeof(Data64),
-                    cudaMemcpyDeviceToDevice,
-                    stream));
+                    HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                        tmp.data(), base_ptr + k * per_diag_elems,
+                        diag_len * sizeof(Data64), cudaMemcpyDeviceToDevice,
+                        stream));
 
-                pt_diag.memory_set(std::move(tmp));
+                    pt_diag.memory_set(std::move(tmp));
+                    pt_diag.scheme_ = scheme_;
+                    pt_diag.plain_size_ = static_cast<int>(diag_len);
+                    pt_diag.in_ntt_domain_ = false; // coeff form
+                    pt_diag.plaintext_generated_ = true;
+                }
 
-                pt_diag.scheme_                = scheme_;
-                pt_diag.plain_size_            = static_cast<int>(per_diag_elems);
-                pt_diag.in_ntt_domain_         = rotated.in_ntt_domain_; // BFV 회전은 false일 것
-                pt_diag.plaintext_generated_   = true;
+                // NTT multiply-accumulate
+                transform_to_ntt_inplace(rotated, opt);
+                transform_to_ntt_inplace(pt_diag, opt);
+                multiply_plain_inplace(rotated, pt_diag, opt);
 
-                // 3) ct × pt
-                multiply_plain_inplace(rotated, pt_diag, options);
-
-                // 4) 누적
-                if (first_term) {
-                    result = rotated;
+                if (first_term)
+                {
+                    acc_ntt = rotated;
                     first_term = false;
-                } else {
-                    add(result, rotated, result, options);
+                }
+                else
+                {
+                    add_inplace(acc_ntt, rotated, opt);
                 }
             }
         }
 
-        return result;
+        if (!first_term)
+        {
+            transform_from_ntt_inplace(acc_ntt, opt);
+        }
+        return acc_ntt;
+    }
+
+    __host__ void heongpu::HEOperator<heongpu::Scheme::RTF>::gen_stream_key(
+        heongpu::DeviceVector<Data64>& nonce, Ciphertext<Scheme::RTF>& ctkey,
+        const ExecutionOptions& options)
+    {
+        return;
+    }
+
+    __host__ void heongpu::HEOperator<heongpu::Scheme::RTF>::add_round_key(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& round_key,
+        Ciphertext<Scheme::RTF>& output, const ExecutionOptions& options)
+    {
+        add(input, round_key, output, options);
+    }
+
+    __host__ void heongpu::HEOperator<heongpu::Scheme::RTF>::feistel(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
+        Galoiskey<Scheme::RTF>& galois_key, const ExecutionOptions& options)
+    {
+        // square, rotate and add
+        auto stream = options.stream_;
+        heongpu::Ciphertext<heongpu::Scheme::RTF> temp =
+            operator_ciphertext(stream);
+
+        multiply_bfv(input, input, temp, options.stream_);
+        rotate_rows_inplace(temp, galois_key, -1, options); // right shift by 1
+        add(input, temp, output, options);
+    }
+
+    __host__ void heongpu::HEOperator<heongpu::Scheme::RTF>::cube(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
+        const ExecutionOptions& options)
+    {
+        multiply_bfv(input, input, output, options.stream_);
+        multiply_bfv(output, input, output, options.stream_);
+    }
+
+    __host__ void heongpu::HEOperator<heongpu::Scheme::RTF>::linear(
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& output,
+        heongpu::HEEncoder<heongpu::Scheme::RTF>& encoder,
+        heongpu::HEContext<heongpu::Scheme::RTF>& context,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        const ExecutionOptions& options)
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault)
+            stream = input.stream();
+
+        ExecutionOptions opt = ExecutionOptions()
+                                   .set_stream(stream)
+                                   .set_storage_type(storage_type::DEVICE)
+                                   .set_initial_location(true);
+
+        if (input.relinearization_required_)
+        {
+            throw std::invalid_argument(
+                "linear(): input has non-linear part; relinearize first.");
+        }
+
+        // Coefficient domain (row rotations)
+        heongpu::Ciphertext<heongpu::Scheme::RTF> x = input;
+        if (x.in_ntt_domain_)
+            transform_from_ntt_inplace(x, opt);
+
+        const size_t N = static_cast<size_t>(n);
+        const size_t row_len = N >> 1; // BFV batching row length
+        const size_t B = 16; // 16x16 block
+        if (row_len % B != 0)
+        {
+            throw std::invalid_argument(
+                "linear(): (n/2) must be a multiple of 16.");
+        }
+        const size_t blocks_per_row = row_len / B;
+
+        static const uint64_t M16[16][16] = {
+            {4, 6, 2, 2, 6, 9, 3, 3, 2, 3, 1, 1, 2, 3, 1, 1},
+            {2, 4, 6, 2, 3, 6, 9, 3, 1, 2, 3, 1, 1, 2, 3, 1},
+            {2, 2, 4, 6, 3, 3, 6, 9, 1, 1, 2, 3, 1, 1, 2, 3},
+            {6, 2, 2, 4, 9, 3, 3, 6, 3, 1, 1, 2, 3, 1, 1, 2},
+            {2, 3, 1, 1, 4, 6, 2, 2, 6, 9, 3, 3, 2, 3, 1, 1},
+            {1, 2, 3, 1, 2, 4, 6, 2, 3, 6, 9, 3, 1, 2, 3, 1},
+            {1, 1, 2, 3, 2, 2, 4, 6, 3, 3, 6, 9, 1, 1, 2, 3},
+            {3, 1, 1, 2, 6, 2, 2, 4, 9, 3, 3, 6, 3, 1, 1, 2},
+            {2, 3, 1, 1, 2, 3, 1, 1, 4, 6, 2, 2, 6, 9, 3, 3},
+            {1, 2, 3, 1, 1, 2, 3, 1, 2, 4, 6, 2, 3, 6, 9, 3},
+            {1, 1, 2, 3, 1, 1, 2, 3, 2, 2, 4, 6, 3, 3, 6, 9},
+            {3, 1, 1, 2, 3, 1, 1, 2, 6, 2, 2, 4, 9, 3, 3, 6},
+            {6, 9, 3, 3, 2, 3, 1, 1, 2, 3, 1, 1, 4, 6, 2, 2},
+            {3, 6, 9, 3, 1, 2, 3, 1, 1, 2, 3, 1, 2, 4, 6, 2},
+            {3, 3, 6, 9, 1, 1, 2, 3, 1, 1, 2, 3, 2, 2, 4, 6},
+            {9, 3, 3, 6, 3, 1, 1, 2, 3, 1, 1, 2, 6, 2, 2, 4}};
+
+        std::vector<std::vector<int>> diags(1);
+        diags[0].reserve(31);
+        diags[0].push_back(0);
+        // Swapped: Lower diagonals < 0 (left-rot), Upper diagonals > 0
+        // (right-rot)
+        for (int s = 1; s < (int) B; ++s)
+            diags[0].push_back(-s);
+        for (int s = 1; s < (int) B; ++s)
+            diags[0].push_back(s);
+
+        const size_t D = diags[0].size(); // 31
+        heongpu::DeviceVector<Data64> blob(N * D, stream);
+
+        // Temporary plaintext for encoding each diagonal
+        heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(context);
+
+        for (size_t k = 0; k < D; ++k)
+        {
+            const int rot = diags[0][k];
+            std::vector<uint64_t> hdiag_vec(N, 0ULL);
+
+            for (size_t row = 0; row < 2; ++row)
+            {
+                const size_t row_base = row * row_len;
+                for (size_t blk = 0; blk < blocks_per_row; ++blk)
+                {
+                    const size_t base = row_base + blk * B;
+                    if (rot == 0)
+                    { // Main diagonal
+                        for (int r = 0; r < (int) B; ++r)
+                        {
+                            hdiag_vec[base + r] = M16[r][r];
+                        }
+                    }
+                    else if (rot > 0)
+                    { // Upper diagonals (Shift > 0)
+                        const int s = rot;
+                        for (int r = 0; r < (int) B - s; ++r)
+                        {
+                            hdiag_vec[base + r] = M16[r][r + s];
+                        }
+                    }
+                    else
+                    { // Lower diagonals (Shift < 0)
+                        const int s = -rot;
+                        for (int r = s; r < (int) B; ++r)
+                        {
+                            hdiag_vec[base + r] = M16[r][r - s];
+                        }
+                    }
+                }
+            }
+
+            // Encode the plaintext diagonal before copying to the blob
+            encoder.encode(pt_diag, hdiag_vec);
+
+            // Copy the properly encoded diagonal (from device) to the
+            // concatenated blob (on device)
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                blob.data() + k * N, pt_diag.data(), N * sizeof(Data64),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+
+        // Single group with 31 diagonals
+        std::vector<heongpu::DeviceVector<Data64>> matrices;
+        matrices.emplace_back(std::move(blob));
+
+        auto y = this->multiply_matrix(x, matrices, diags, galois_key, opt);
+        output = y;
     }
 
     __host__ void HEOperator<Scheme::RTF>::relinearize_seal_method_inplace(
@@ -1622,8 +1818,7 @@ namespace heongpu
     ////////////////////////////////////////////////////////////////
 
     __host__ Ciphertext<Scheme::RTF>
-    HEOperator<Scheme::RTF>::operator_ciphertext(double scale,
-                                                  cudaStream_t stream)
+    HEOperator<Scheme::RTF>::operator_ciphertext(cudaStream_t stream)
     {
         Ciphertext<Scheme::RTF> cipher;
 
@@ -1643,7 +1838,7 @@ namespace heongpu
 
         // int cipher_memory_size = 2 * (Q_size_ - cipher.depth_) * n;
         int cipher_memory_size = 2 * Q_size_ * n;
-        
+
         cipher.device_locations_ =
             DeviceVector<Data64>(cipher_memory_size, stream);
 

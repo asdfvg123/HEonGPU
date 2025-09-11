@@ -1218,6 +1218,41 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
 
+        __host__ void gen_stream_key(
+            heongpu::DeviceVector<Data64>& nonce,
+            Ciphertext<Scheme::RTF>& ctkey,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void add_round_key(
+            Ciphertext<Scheme::RTF>& input,
+            Ciphertext<Scheme::RTF>& round_key,
+            Ciphertext<Scheme::RTF>& output,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void feistel(
+            Ciphertext<Scheme::RTF>& input,
+            Ciphertext<Scheme::RTF>& output,
+            Galoiskey<Scheme::RTF>& galois_key,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void cube(
+            Ciphertext<Scheme::RTF>& input,
+            Ciphertext<Scheme::RTF>& output,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void linear(
+            Ciphertext<Scheme::RTF>& input,
+            Ciphertext<Scheme::RTF>& output,
+            HEEncoder<Scheme::RTF>& encoder,
+            HEContext<Scheme::RTF>& context,
+            Galoiskey<Scheme::RTF>& galois_key,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+    
 
         // private:
       protected:
@@ -1449,8 +1484,7 @@ namespace heongpu
       protected:
 
         __host__ Ciphertext<Scheme::RTF>
-        operator_ciphertext(double scale,
-                            cudaStream_t stream = cudaStreamDefault);
+        operator_ciphertext(cudaStream_t stream = cudaStreamDefault);
 
 
         // Just for copy parameters, not memory!
