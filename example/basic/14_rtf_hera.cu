@@ -72,6 +72,7 @@ int main(int argc, char* argv[])
     heongpu::HEEncryptor<Scheme> encryptor(context, public_key);
     heongpu::HEDecryptor<Scheme> decryptor(context, secret_key);
     heongpu::HEArithmeticOperator<Scheme> operators(context, encoder);
+    heongpu::HEHERA<Scheme> hera(context, encoder, operators);
 
     // --- Test message: first 16 slots = 1..16, others 0 ---
     std::vector<uint64_t> message(poly_modulus_degree, 0ULL);
@@ -79,7 +80,7 @@ int main(int argc, char* argv[])
     for (int i = 16; i < 32; ++i) message[i] = static_cast<uint64_t>(i + 1 - 16);
 
 
-    std::cout << "[Input] First 16 entries:\n";
+    std::cout << "[Input] First 64 entries:\n";
     for(int i = 0; i < 64; ++i) {
         std::cout << message[i] << " ";
         if (i % 16 == 15) std::cout << "\n";
@@ -94,9 +95,9 @@ int main(int argc, char* argv[])
 
     // --- Run GPU linear (MixRows -> MixColumns) ---
     heongpu::Ciphertext<Scheme> C_lin(context);
-    std::cout << "\nRunning operators.linear() ...\n";
+    std::cout << "\nRunning hera.linear() ...\n";
 
-    operators.linear(C, C_lin, encoder, context,  galois_key);
+    hera.linear(C, C_lin, encoder, context,  galois_key);
 
     // Decrypt & Decode
     heongpu::Plaintext<Scheme> P_lin(context);
@@ -105,7 +106,7 @@ int main(int argc, char* argv[])
     std::vector<uint64_t> vec_lin;
     encoder.decode(vec_lin, P_lin);
 
-    std::cout << "\n[Output after linear()] First 16 entries:\n";
+    std::cout << "\n[Output after linear()] First 64 entries:\n";
     for(int i = 0; i < 128; ++i) {
         std::cout << vec_lin[i] << " ";
         if (i % 16 == 15) std::cout << "\n";

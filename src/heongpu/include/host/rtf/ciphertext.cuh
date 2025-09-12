@@ -19,6 +19,8 @@ namespace heongpu
         template <Scheme S> friend class HEArithmeticOperator;
         template <Scheme S> friend class HELogicOperator;
         template <Scheme S> friend class HEMultiPartyManager;
+        template <Scheme S> friend class HEHERA;
+
 
         template <typename T, typename F>
         friend void input_storage_manager(T& object, F function,

@@ -44,6 +44,7 @@
 #include "rtf/decryptor.cuh"
 #include "rtf/operator.cuh"
 #include "rtf/mpcmanager.cuh"
+#include "rtf/hera.cuh"
 
 
 #include "tfhe/context.cuh"
