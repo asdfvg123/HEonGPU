@@ -11,6 +11,7 @@
 
 #include "rtf/context.cuh"
 #include "rtf/encoder.cuh"
+#include "rtf/encryptor.cuh"
 #include "rtf/plaintext.cuh"
 #include "rtf/ciphertext.cuh"
 #include "rtf/evaluationkey.cuh"
@@ -32,7 +33,12 @@ namespace heongpu
          */
         __host__ HEHERA(HEContext<Scheme::RTF>& context,
                          HEEncoder<Scheme::RTF>& encoder,
-                         HEOperator<Scheme::RTF>& op);
+                         HEEncryptor<Scheme::RTF>& encryptor,
+                         HEOperator<Scheme::RTF>& op,
+                         Galoiskey<Scheme::RTF>& galois_key,
+                         Relinkey<Scheme::RTF>& relin_key,
+                        const ExecutionOptions& options = ExecutionOptions()
+                        );
 
 
         HEHERA() = default;
@@ -41,9 +47,11 @@ namespace heongpu
         HEHERA& operator=(const HEHERA& assign) = default;
         HEHERA& operator=(HEHERA&& assign) = default;
 
+        __host__ void precompute(Ciphertext<Scheme::RTF>& key, 
+            const ExecutionOptions& options = ExecutionOptions());
 
-        __host__ void gen_stream_key(
-            heongpu::DeviceVector<Data64>& nonce,
+        __host__ Ciphertext<Scheme::RTF> gen_stream_key(
+            // heongpu::DeviceVector<Data64>& nonce,
             Ciphertext<Scheme::RTF>& ctkey,
             const ExecutionOptions& options = ExecutionOptions()
         );
@@ -71,17 +79,26 @@ namespace heongpu
         __host__ void linear(
             Ciphertext<Scheme::RTF>& input,
             Ciphertext<Scheme::RTF>& output,
-            HEEncoder<Scheme::RTF>& encoder,
-            HEContext<Scheme::RTF>& context,
-            Galoiskey<Scheme::RTF>& galois_key,
             const ExecutionOptions& options = ExecutionOptions()
         );
-    
+        __host__ heongpu::Ciphertext<Scheme::RTF> get_icCt(){
+            return icCt_;
+        };
+        __host__ [[nodiscard]]
+        const std::vector<std::vector<uint64_t>>& get_rcVec() const noexcept {
+            return rcVec;
+        }
+        __host__ std::vector<Ciphertext<Scheme::RTF>> get_rckCt(){
+            return rckCt;
+        };
 
     private:
         HEContext<Scheme::RTF>& context_;   
-        HEEncoder<Scheme::RTF>& encoder_;   
+        HEEncoder<Scheme::RTF>& encoder_;  
+        HEEncryptor<Scheme::RTF>& encryptor_; 
         HEOperator<Scheme::RTF>& operator_;
+        Galoiskey<Scheme::RTF>& galois_key_;
+        Relinkey<Scheme::RTF> relin_key_;
         scheme_type scheme_;
 
         int n;
@@ -186,6 +203,27 @@ namespace heongpu
         std::shared_ptr<DeviceVector<Ninverse64>> n_plain_inverse_;
         std::shared_ptr<DeviceVector<Root64>> plain_intt_tables_;
         std::shared_ptr<DeviceVector<Data64>> encoding_location_;
+
+        
+        // hera
+        int round_ = 2;
+        size_t rc_vec_size_ = 0;
+
+        std::vector<heongpu::DeviceVector<Data64>> linear_matrix_diagonals_;
+        std::vector<std::vector<int>> linear_matrix_shifts_;
+
+        std::vector<uint64_t> icVec;
+        Plaintext<Scheme::RTF> icPt_;
+        Ciphertext<Scheme::RTF> icCt_;
+
+        std::vector<std::vector<uint64_t>> rcVec;
+
+        std::vector<Plaintext<Scheme::RTF>> rcPt;
+
+        std::vector<Ciphertext<Scheme::RTF>> rckCt; // rc * k
+
+
+        
     }; 
 } // namespace heongpu
 

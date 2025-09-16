@@ -20,12 +20,14 @@ int main(int argc, char* argv[])
     heongpu::HEContext<Scheme> context(
         heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
 
-    size_t poly_modulus_degree = 4096; // divisible by 16
+    size_t poly_modulus_degree = 32768; // divisible by 16
     context.set_poly_modulus_degree(poly_modulus_degree);
 
     context.set_coeff_modulus_default_values(1);
 
-    int plain_modulus = 786433; // prime t
+    // int plain_modulus = 786433; // prime t
+    int plain_modulus = 0x1fc0001ULL;
+
     context.set_plain_modulus(plain_modulus);
 
     context.generate();
@@ -72,13 +74,15 @@ int main(int argc, char* argv[])
     heongpu::HEEncryptor<Scheme> encryptor(context, public_key);
     heongpu::HEDecryptor<Scheme> decryptor(context, secret_key);
     heongpu::HEArithmeticOperator<Scheme> operators(context, encoder);
-    heongpu::HEHERA<Scheme> hera(context, encoder, operators);
 
     // --- Test message: first 16 slots = 1..16, others 0 ---
     std::vector<uint64_t> message(poly_modulus_degree, 0ULL);
     for (int i = 0; i < 16; ++i) message[i] = static_cast<uint64_t>(i + 1);
     for (int i = 16; i < 32; ++i) message[i] = static_cast<uint64_t>(i + 1 - 16);
 
+    std::vector<uint64_t> keyhera(poly_modulus_degree, 0ULL);
+    for (int i = 0; i < 16; ++i) keyhera[i] = static_cast<uint64_t>(i + 1);
+    for (int i = 16; i < 32; ++i) keyhera[i] = static_cast<uint64_t>(i + 1 - 16);
 
     std::cout << "[Input] First 64 entries:\n";
     for(int i = 0; i < 64; ++i) {
@@ -93,11 +97,41 @@ int main(int argc, char* argv[])
     heongpu::Ciphertext<Scheme> C(context);
     encryptor.encrypt(C, P);
 
-    // --- Run GPU linear (MixRows -> MixColumns) ---
-    heongpu::Ciphertext<Scheme> C_lin(context);
-    std::cout << "\nRunning hera.linear() ...\n";
+    heongpu::Plaintext<Scheme> P_keyhera(context);
+    encoder.encode(P_keyhera, keyhera);
+    heongpu::Ciphertext<Scheme> C_keyhera(context);
+    encryptor.encrypt(C_keyhera, P_keyhera);
 
-    hera.linear(C, C_lin, encoder, context,  galois_key);
+    heongpu::HEHERA<Scheme> hera(
+        context, encoder, encryptor, operators, galois_key, relin_key);
+    
+   
+    auto icCt_ = hera.get_icCt();
+    heongpu::Plaintext<Scheme> P_ic(context);
+    decryptor.decrypt(P_ic, icCt_);
+    
+    std::vector<uint64_t> vec_ic;
+    encoder.decode(vec_ic, P_ic);
+    
+    // std::cout << "\n[HERA Initial Condition] First 64 entries:\n";
+    // for(int i = 0; i < 64; ++i) {
+    //     std::cout << vec_ic[i] << " ";
+    //     if (i % 16 == 15) std::cout << "\n";
+    // }
+    // std::cout << std::endl;
+
+    // auto rcVec = hera.get_rcVec();
+    // std::cout << "\n[HERA Random Coefficients] First 16 entries of round 0:\n";
+    // for(int i = 0; i < 16; ++i) {
+    //     std::cout << rcVec[0][i] << " ";
+    //     if (i % 16 == 15) std::cout << "\n";
+    // }   
+    // --- Run GPU linear (MixRows -> MixColumns) ---
+    std::cout << "\nRunning hera ...\n";
+
+    // heongpu::DeviceVector<Data64> nonce;
+    auto C_lin = hera.gen_stream_key(C_keyhera);
+    cudaDeviceSynchronize();
 
     // Decrypt & Decode
     heongpu::Plaintext<Scheme> P_lin(context);

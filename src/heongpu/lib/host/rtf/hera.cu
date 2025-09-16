@@ -7,12 +7,25 @@ namespace heongpu
     __host__
     HEHERA<Scheme::RTF>::HEHERA(HEContext<Scheme::RTF>& context,
                                 HEEncoder<Scheme::RTF>& encoder,
-                                HEOperator<Scheme::RTF>& op)
-        : context_(context), encoder_(encoder), operator_(op)
+                                HEEncryptor<Scheme::RTF>& encryptor,
+                                HEOperator<Scheme::RTF>& op,
+                                Galoiskey<Scheme::RTF>& galois_key,
+                                Relinkey<Scheme::RTF>& relin_key,
+                                const ExecutionOptions& options
+                            )
+        : 
+        context_(context), 
+        encoder_(encoder), 
+        encryptor_(encryptor), 
+        operator_(op), 
+        galois_key_(galois_key),
+        relin_key_(relin_key)
     {
         if (!context.context_generated_){
             throw std::invalid_argument("HEContext is not generated!");
         }
+        cudaStream_t stream = options.stream_;
+        cudaStreamSynchronize(stream);
 
         scheme_ = context.scheme_;
 
@@ -164,79 +177,71 @@ namespace heongpu
         plain_intt_tables_ = encoder.plain_intt_tables_;
         encoding_location_ = encoder.encoding_location_;
 
-    }
 
-    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::gen_stream_key(
-        heongpu::DeviceVector<Data64>& nonce, Ciphertext<Scheme::RTF>& ctkey,
-        const ExecutionOptions& options)
-    {
-        return;
-    }
-
-    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::add_round_key(
-        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& round_key,
-        Ciphertext<Scheme::RTF>& output, const ExecutionOptions& options)
-    {
-        operator_.add(input, round_key, output, options);
-    }
-
-    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::feistel(
-        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
-        Galoiskey<Scheme::RTF>& galois_key, const ExecutionOptions& options)
-    {
-        // square, rotate and add
-        auto stream = options.stream_;
-        heongpu::Ciphertext<heongpu::Scheme::RTF> temp =
-            operator_.operator_ciphertext(stream);
-
-        operator_.multiply_bfv(input, input, temp, options.stream_);
-        operator_.rotate_rows_inplace(temp, galois_key, -1, options); // right shift by 1
-        operator_.add(input, temp, output, options);
-    }
-
-    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::cube(
-        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
-        const ExecutionOptions& options)
-    {
-        operator_.multiply_bfv(input, input, output, options.stream_);
-        operator_.multiply_bfv(output, input, output, options.stream_);
-    }
-
-    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::linear(
-        heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
-        heongpu::Ciphertext<heongpu::Scheme::RTF>& output,
-        heongpu::HEEncoder<heongpu::Scheme::RTF>& encoder,
-        heongpu::HEContext<heongpu::Scheme::RTF>& context,
-        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
-        const ExecutionOptions& options)
-    {
-        cudaStream_t stream = options.stream_;
-        if (stream == cudaStreamDefault)
-            stream = input.stream();
-
-        ExecutionOptions opt = ExecutionOptions()
-                                   .set_stream(stream)
-                                   .set_storage_type(storage_type::DEVICE)
-                                   .set_initial_location(true);
-
-        if (input.relinearization_required_)
+        // hera setup
+        
+        rc_vec_size_ = static_cast<size_t>(round_ + 1) * n;
+        // initialize IC
+        icVec.resize(n);
+        for (int i = 0; i < n; i++)
         {
-            throw std::invalid_argument(
-                "linear(): input has non-linear part; relinearize first.");
+            icVec[i] = (i % 16) + 1;
+        }
+        icPt_ = Plaintext<Scheme::RTF>(context);
+        icCt_ = Ciphertext<Scheme::RTF>(context);
+        
+        encoder_.encode(icPt_, icVec, options);
+        encryptor_.encrypt(icCt_, icPt_, options);
+        
+        icCt_.store_in_device(stream);
+
+        // initialize round constants
+        // TODO : this part takes time and thus synchronization issue
+
+        // heongpu::DeviceVector<Data64> d_rc(rc_vec_size_, stream);
+        // heongpu::DeviceVector<Modulus64> d_mod(1, stream);
+
+        // HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+        //     d_mod.data(), &plain_modulus_, sizeof(Modulus64), cudaMemcpyHostToDevice, stream));
+
+        // heongpu::RandomNumberGenerator::instance()
+        //     .modular_uniform_random_number_generation(
+        //         d_rc.data(), d_mod.data(), static_cast<Data64>(n_power),
+        //         /*mod_count=*/1, /*repeat_count=*/round_, stream);
+
+        // HEONGPU_CUDA_CHECK(cudaGetLastError());
+        // HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        std::vector<uint64_t> flat(rc_vec_size_, 2ULL);
+        // HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+        //     flat.data(), d_rc.data(), rc_vec_size_ * sizeof(Data64),
+        //     cudaMemcpyDeviceToHost, stream));
+        // HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        rcVec.assign(static_cast<size_t>(round_ + 1), std::vector<uint64_t>(n));
+        for (int r = 0; r < round_+1; ++r) {
+            rcVec[r].assign(flat.begin() + r * n, flat.begin() + (r + 1) * n);
         }
 
-        // Coefficient domain (row rotations)
-        heongpu::Ciphertext<heongpu::Scheme::RTF> x = input;
-        if (x.in_ntt_domain_)
-            operator_.transform_from_ntt_inplace(x, opt);
+        
+        rcPt.reserve(round_+1);
+        rckCt.reserve(round_+1);
+        // encode rc
+        
+        for (int r = 0; r < round_+1; ++r) {
+            Plaintext<Scheme::RTF> pt(context);
+            encoder_.encode(pt, rcVec[r], options);
+            pt.store_in_device(options.stream_);
+            rcPt.emplace_back(std::move(pt));
+        }
+        
 
-        const size_t N = static_cast<size_t>(n);
-        const size_t row_len = N >> 1; // BFV batching row length
-        const size_t B = 16; // 16x16 block
+        const size_t row_len = n >> 1; // BFV batching row length
+        const size_t B = 16;           // 16x16 block
         if (row_len % B != 0)
         {
             throw std::invalid_argument(
-                "linear(): (n/2) must be a multiple of 16.");
+                "HEHERA::ctor: (n/2) must be a multiple of 16.");
         }
         const size_t blocks_per_row = row_len / B;
 
@@ -257,27 +262,23 @@ namespace heongpu
             {3, 6, 9, 3, 1, 2, 3, 1, 1, 2, 3, 1, 2, 4, 6, 2},
             {3, 3, 6, 9, 1, 1, 2, 3, 1, 1, 2, 3, 2, 2, 4, 6},
             {9, 3, 3, 6, 3, 1, 1, 2, 3, 1, 1, 2, 6, 2, 2, 4}};
+        
+        linear_matrix_shifts_.resize(1);
+        linear_matrix_shifts_[0].reserve(31);
+        linear_matrix_shifts_[0].push_back(0);
+        
+        // Lower diagonals (< 0), Upper diagonals (> 0)
+        for (int s = 1; s < (int)B; ++s) linear_matrix_shifts_[0].push_back(-s);
+        for (int s = 1; s < (int)B; ++s) linear_matrix_shifts_[0].push_back(s);
 
-        std::vector<std::vector<int>> diags(1);
-        diags[0].reserve(31);
-        diags[0].push_back(0);
-        // Swapped: Lower diagonals < 0 (left-rot), Upper diagonals > 0
-        // (right-rot)
-        for (int s = 1; s < (int) B; ++s)
-            diags[0].push_back(-s);
-        for (int s = 1; s < (int) B; ++s)
-            diags[0].push_back(s);
-
-        const size_t D = diags[0].size(); // 31
-        heongpu::DeviceVector<Data64> blob(N * D, stream);
-
-        // Temporary plaintext for encoding each diagonal
+        const size_t D = linear_matrix_shifts_[0].size();
+        heongpu::DeviceVector<Data64> blob(n * D, stream);
         heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(context);
 
         for (size_t k = 0; k < D; ++k)
         {
-            const int rot = diags[0][k];
-            std::vector<uint64_t> hdiag_vec(N, 0ULL);
+            const int rot = linear_matrix_shifts_[0][k];
+            std::vector<uint64_t> hdiag_vec(n, 0ULL);
 
             for (size_t row = 0; row < 2; ++row)
             {
@@ -285,48 +286,159 @@ namespace heongpu
                 for (size_t blk = 0; blk < blocks_per_row; ++blk)
                 {
                     const size_t base = row_base + blk * B;
-                    if (rot == 0)
-                    { // Main diagonal
-                        for (int r = 0; r < (int) B; ++r)
-                        {
-                            hdiag_vec[base + r] = M16[r][r];
-                        }
-                    }
-                    else if (rot > 0)
-                    { // Upper diagonals (Shift > 0)
+                    if (rot == 0) { // Main diagonal
+                        for (int r = 0; r < (int)B; ++r) hdiag_vec[base + r] = M16[r][r];
+                    } else if (rot > 0) { // Upper diagonals
                         const int s = rot;
-                        for (int r = 0; r < (int) B - s; ++r)
-                        {
-                            hdiag_vec[base + r] = M16[r][r + s];
-                        }
-                    }
-                    else
-                    { // Lower diagonals (Shift < 0)
+                        for (int r = 0; r < (int)B - s; ++r) hdiag_vec[base + r] = M16[r][r + s];
+                    } else { // Lower diagonals
                         const int s = -rot;
-                        for (int r = s; r < (int) B; ++r)
-                        {
-                            hdiag_vec[base + r] = M16[r][r - s];
-                        }
+                        for (int r = s; r < (int)B; ++r) hdiag_vec[base + r] = M16[r][r - s];
                     }
                 }
             }
-
-            // Encode the plaintext diagonal before copying to the blob
-            encoder.encode(pt_diag, hdiag_vec);
-
-            // Copy the properly encoded diagonal (from device) to the
-            // concatenated blob (on device)
+            
+            encoder.encode(pt_diag, hdiag_vec, options);
             HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                blob.data() + k * N, pt_diag.data(), N * sizeof(Data64),
+                blob.data() + k * n, pt_diag.data(), n * sizeof(Data64),
                 cudaMemcpyDeviceToDevice, stream));
         }
+        
+        // Store the completed blob in the member variable
+        linear_matrix_diagonals_.emplace_back(std::move(blob));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::cout << "HERA initialized." << std::endl;
 
-        // Single group with 31 diagonals
-        std::vector<heongpu::DeviceVector<Data64>> matrices;
-        matrices.emplace_back(std::move(blob));
+    }
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::precompute(
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& key,
+        const heongpu::ExecutionOptions& options)
+    {
+        rckCt.clear();
+        rckCt.reserve(round_+1);  // you only fill 0..round_-1
+        auto opt = ExecutionOptions().set_stream(options.stream_)
+                                    .set_storage_type(storage_type::DEVICE)
+                                    .set_initial_location(true);
 
-        auto y = operator_.multiply_matrix(x, matrices, diags, galois_key, opt);
+        for (int r = 0; r < round_+1; ++r) {
+            Ciphertext<Scheme::RTF> ct(context_);           // own buffers
+            ct.store_in_device(options.stream_);
+            operator_.multiply_plain(key, rcPt[r], ct, opt);
+            rckCt.emplace_back(std::move(ct));
+        }
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
+    }
+
+    __host__ Ciphertext<Scheme::RTF> heongpu::HEHERA<heongpu::Scheme::RTF>::gen_stream_key(
+        // heongpu::DeviceVector<Data64>& nonce, 
+        Ciphertext<Scheme::RTF>& key,
+        const ExecutionOptions& options)
+    {
+        Ciphertext<Scheme::RTF> result(context_);
+        precompute(key, options);
+
+        // ark
+        add_round_key(icCt_, rckCt[0], result, options);
+        // std::cout << "here3" << std::endl;
+        
+        // round_function
+        for (int r = 1; r < round_; ++r)
+        {
+            linear(result, result, options);
+            cube(result, result, options);
+            add_round_key(result, rckCt[r], result, options);
+
+        }
+
+        linear(result, result, options);
+        cube(result, result, options);
+        linear(result, result, options);
+        add_round_key(result, rckCt[round_], result, options);
+
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
+        return result;
+
+
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::add_round_key(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& round_key,
+        Ciphertext<Scheme::RTF>& output, const ExecutionOptions& options)
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = input.stream();
+        operator_.add(input, round_key, output, options);
+
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::feistel(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
+        Galoiskey<Scheme::RTF>& galois_key, const ExecutionOptions& options)
+    {
+        // square, rotate and add
+        auto stream = options.stream_;
+        heongpu::Ciphertext<heongpu::Scheme::RTF> temp =
+            operator_.operator_ciphertext(stream);
+
+        operator_.multiply_bfv(input, input, temp, options.stream_);
+        operator_.rotate_rows_inplace(temp, galois_key, -1, options); // right shift by 1
+        operator_.add(input, temp, output, options);
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::cube(
+        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
+        const ExecutionOptions& options)
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = input.stream();
+            
+        operator_.multiply_inplace(input, input, options);
+        operator_.relinearize_inplace(input, relin_key_, options);
+        operator_.multiply(input, input, output, options);
+        operator_.relinearize_inplace(output, relin_key_, options);
+
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::linear(
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& output,
+        const ExecutionOptions& options)
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = input.stream();
+
+        ExecutionOptions opt = ExecutionOptions()
+                                   .set_stream(stream)
+                                   .set_storage_type(storage_type::DEVICE)
+                                   .set_initial_location(true);
+
+        if (input.relinearization_required_)
+        {
+            throw std::invalid_argument(
+                "linear(): input has non-linear part; relinearize first.");
+        }
+
+        heongpu::Ciphertext<heongpu::Scheme::RTF> x = input;
+        if (x.in_ntt_domain_)
+        {
+            operator_.transform_from_ntt_inplace(x, opt);
+        }
+
+        auto y = operator_.multiply_matrix(x, 
+                                          this->linear_matrix_diagonals_, 
+                                          this->linear_matrix_shifts_, 
+                                          galois_key_, 
+                                          opt);
         output = y;
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
     }
 
 
