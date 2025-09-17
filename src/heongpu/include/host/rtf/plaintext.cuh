@@ -136,6 +136,19 @@ namespace heongpu
             }
         }
 
+        Plaintext(scheme_type& scheme,
+                const DeviceVector<Data64>& vec, bool is_ntt = false)
+            : scheme_(scheme), plain_size_(static_cast<int>(vec.size())),
+            in_ntt_domain_(is_ntt), storage_type_(storage_type::DEVICE),
+            plaintext_generated_(true)
+        {
+            // Allocate memory and copy the data from the source vector
+            device_locations_.resize(vec.size(), vec.stream());
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                device_locations_.data(), vec.data(), vec.size() * sizeof(Data64),
+                cudaMemcpyDeviceToDevice, vec.stream()));
+        }
+
         Plaintext(Plaintext&& assign) noexcept
             : scheme_(std::move(assign.scheme_)),
               plain_size_(std::move(assign.plain_size_)),

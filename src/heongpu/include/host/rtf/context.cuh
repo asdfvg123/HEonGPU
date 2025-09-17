@@ -246,6 +246,7 @@ namespace heongpu
         std::shared_ptr<DeviceVector<Ninverse64>> n_plain_inverse_;
         std::shared_ptr<DeviceVector<Root64>> plain_ntt_tables_;
         std::shared_ptr<DeviceVector<Root64>> plain_intt_tables_;
+        Data64 plain_psi_;
 
         Modulus64 gamma_;
         std::shared_ptr<DeviceVector<Data64>> coeeff_div_plainmod_;

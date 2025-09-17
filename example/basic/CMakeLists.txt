@@ -20,6 +20,9 @@ set(EXECUTABLES
     12_basic_tfhe 12_basic_tfhe.cu
     13_basic_rtf_matmul 13_basic_rtf_matmul.cu
     14_rtf_hera 14_rtf_hera.cu
+    15_rtf_fv_slot2coeff 15_rtf_fv_slot2coeff.cu
+    16_rtf_matmul_bsgs 16_rtf_matmul_bsgs.cu
+
 )
 
 function(add_example exe source)

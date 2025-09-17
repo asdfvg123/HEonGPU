@@ -478,7 +478,7 @@ namespace heongpu
             Modulus64 plain_mod = plain_modulus_;
 
             Data64 plain_psi = find_minimal_primitive_root(2 * n, plain_mod);
-
+            plain_psi_ = plain_psi;
             std::vector<Root64> plain_forward_table =
                 generate_ntt_table({plain_psi}, {plain_mod}, n_power);
             std::vector<Root64> plain_inverse_table =

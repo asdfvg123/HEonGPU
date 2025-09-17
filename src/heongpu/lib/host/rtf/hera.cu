@@ -179,6 +179,7 @@ namespace heongpu
 
 
         // hera setup
+        plain_psi_ = context.plain_psi_;
         
         rc_vec_size_ = static_cast<size_t>(round_ + 1) * n;
         // initialize IC

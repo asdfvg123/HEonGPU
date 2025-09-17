@@ -632,8 +632,7 @@ namespace heongpu
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
-        std::vector<heongpu::DeviceVector<Data64>>&
-            matrix, // concatenated diags
+        std::vector<heongpu::DeviceVector<Data64>>& matrix, // concatenated diags
         std::vector<std::vector<int>>& diags, // per-group rotation list
         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
         const ExecutionOptions& options)
@@ -728,6 +727,166 @@ namespace heongpu
             transform_from_ntt_inplace(acc_ntt, opt);
         }
         return acc_ntt;
+    }
+
+    /**
+     * @brief Performs sequential homomorphic matrix-vector multiplications using the 
+     * Baby-Step Giant-Step (BSGS) optimization.
+     * * This function processes a series of matrices, where the output of one multiplication
+     * becomes the input for the next. The BSGS algorithm is employed to reduce the total 
+     * number of homomorphic rotations, which are typically the most performance-intensive
+     * part of the operation.
+     * * A standard rotation 'k' is decomposed into k = i*g2 + j, where:
+     * - 'j' represents the "baby steps" (0 <= j < g2).
+     * - 'i' represents the "giant steps" (0 <= i < g1).
+     * * The algorithm first precomputes all necessary baby-step rotations of the input ciphertext.
+     * Then, for each giant step, it multiplies the corresponding pre-rotated ciphertexts by the
+     * appropriate diagonals and accumulates them. Finally, a single giant-step rotation is
+     * applied to each accumulated sum before they are all combined into the final result.
+     * * @param input The initial input ciphertext (encrypted vector).
+     * @param matrix_groups A vector of matrix groups. `matrix_groups[i]` contains the 
+     * diagonal data for the i-th matrix in the sequence.
+     * @param shifts A vector of shift values. `shifts[i]` contains the rotation amounts 
+     * for the diagonals of the i-th matrix.
+     * @param galois_key The Galois keys required for performing the rotations.
+     * @param opt The execution options, including the CUDA stream.
+     * @return A ciphertext containing the result of the final matrix multiplication.
+     */
+    __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
+    heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix_bsgs(
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
+        const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups,
+        const std::vector<std::vector<int>>& shifts,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        const ExecutionOptions& opt)
+    {
+        cudaStream_t stream = opt.stream_;
+        if (stream == cudaStreamDefault)
+            stream = input.stream();
+
+        ExecutionOptions local_opt = ExecutionOptions()
+                                        .set_stream(stream)
+                                        .set_storage_type(storage_type::DEVICE)
+                                        .set_initial_location(true);
+
+        heongpu::Ciphertext<heongpu::Scheme::RTF> current_ct = input;
+
+        // Rotations assume coeff domain. Keep ct in coeff domain for rotations.
+        if (current_ct.in_ntt_domain_) {
+            transform_from_ntt_inplace(current_ct, local_opt);
+        }
+
+        const int N = static_cast<int>(n);
+        const int row_len = N >> 1;
+        const size_t g2 = static_cast<size_t>(ceil(sqrt(row_len))); // baby step count  (0..g2-1)
+
+        for (size_t m_idx = 0; m_idx < matrix_groups.size(); ++m_idx)
+        {
+            if (current_ct.relinearization_required_) {
+                throw std::invalid_argument("multiply_matrix_bsgs: input requires relinearization.");
+            }
+
+            // -----------------------------
+            // 1) Baby steps: Rot(x, j), j=0..g2-1 (left rotations)
+            // -----------------------------
+            std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
+            baby_steps[0] = current_ct;
+            for (size_t j = 1; j < g2; ++j) {
+                baby_steps[j] = baby_steps[j - 1];
+                // rotate left by +1 each time
+                rotate_rows_inplace(baby_steps[j], galois_key, /*steps=*/1, local_opt);
+            }
+
+            // -----------------------------
+            // 2) Giant step accumulation in NTT
+            // S_i = sum_j diag_{i*g2 + j} * Rot(x, j)
+            // -----------------------------
+            std::map<int, heongpu::Ciphertext<heongpu::Scheme::RTF>> giant_steps_sum;
+
+            for (size_t b = 0; b < matrix_groups[m_idx].size(); ++b)
+            {
+                const auto& blob = matrix_groups[m_idx][b];           // concatenated diagonals [k][N]
+                const auto& current_shifts = shifts[m_idx];
+                const Data64* base_ptr = reinterpret_cast<const Data64*>(blob.data());
+
+                for (size_t k = 0; k < current_shifts.size(); ++k)
+                {
+                    const int s = current_shifts[k]; // *** left-rotation amount ***
+                    const int g2_signed = static_cast<int>(g2);
+
+                    // Decompose s = i*g2 + j with j in [0, g2-1]
+                    int j = (s % g2_signed + g2_signed) % g2_signed;
+                    int i = (s - j) / g2_signed;
+
+                    // term = Rot(x, j)
+                    heongpu::Ciphertext<heongpu::Scheme::RTF> term = baby_steps[static_cast<size_t>(j)];
+
+                    // Load diag_{s} into a plaintext
+                    heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
+                    {
+                        heongpu::DeviceVector<Data64> tmp(N, stream);
+                        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(tmp.data(),
+                                                        base_ptr + k * N,
+                                                        N * sizeof(Data64),
+                                                        cudaMemcpyDeviceToDevice,
+                                                        stream));
+                        pt_diag.memory_set(std::move(tmp));
+                        pt_diag.scheme_ = scheme_;
+                        pt_diag.plain_size_ = N;
+                        pt_diag.in_ntt_domain_ = false;     // encoded in coeff domain
+                        pt_diag.plaintext_generated_ = true;
+                    }
+
+                    // multiply in NTT
+                    transform_to_ntt_inplace(term, local_opt);
+                    transform_to_ntt_inplace(pt_diag, local_opt);
+                    multiply_plain_inplace(term, pt_diag, local_opt);
+
+                    // Accumulate into S_i (still NTT)
+                    auto it = giant_steps_sum.find(i);
+                    if (it == giant_steps_sum.end()) {
+                        giant_steps_sum.emplace(i, std::move(term));
+                    } else {
+                        add_inplace(it->second, term, local_opt);
+                    }
+                }
+            }
+
+            // -----------------------------
+            // 3) Final combination:
+            //    sum over i of Rot(S_i, i*g2)
+            //    Rotations in coeff domain; keep sums in NTT until rotation step.
+            // -----------------------------
+            heongpu::Ciphertext<heongpu::Scheme::RTF> matrix_result_ntt;
+            bool result_initialized = false;
+
+            for (auto& kv : giant_steps_sum)
+            {
+                const int i = kv.first;
+                auto& sum_ct = kv.second;  // NTT
+
+                // rotate by +i*g2 (left) in coeff domain
+                transform_from_ntt_inplace(sum_ct, local_opt);
+                const long long giant_rotation_amount = static_cast<long long>(i) * static_cast<long long>(g2);
+                rotate_rows_inplace(sum_ct, galois_key, giant_rotation_amount, local_opt);
+                transform_to_ntt_inplace(sum_ct, local_opt);
+
+                if (!result_initialized) {
+                    matrix_result_ntt = std::move(sum_ct);
+                    result_initialized = true;
+                } else {
+                    add_inplace(matrix_result_ntt, sum_ct, local_opt);
+                }
+            }
+
+            if (result_initialized) {
+                transform_from_ntt_inplace(matrix_result_ntt, local_opt);
+                current_ct = std::move(matrix_result_ntt);
+            }
+            // else: this group had no diagonals; leave current_ct unchanged
+        }
+
+        return current_ct;
     }
 
     __host__ void HEOperator<Scheme::RTF>::relinearize_seal_method_inplace(

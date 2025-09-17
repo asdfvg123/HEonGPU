@@ -81,6 +81,9 @@ namespace heongpu
             Ciphertext<Scheme::RTF>& output,
             const ExecutionOptions& options = ExecutionOptions()
         );
+
+
+
         __host__ heongpu::Ciphertext<Scheme::RTF> get_icCt(){
             return icCt_;
         };
@@ -91,6 +94,35 @@ namespace heongpu
         __host__ std::vector<Ciphertext<Scheme::RTF>> get_rckCt(){
             return rckCt;
         };
+
+        __host__ Data64 get_plain_psi(){
+            return plain_psi_;
+        };
+
+        __host__ void print_ntt_table_host(std::size_t count,
+                                   cudaStream_t stream = cudaStreamDefault) const {
+            if (stream == cudaStreamDefault) {
+                // Use the vector’s stream if available
+                stream = ntt_table_->stream();
+            }
+
+            const std::size_t k = std::min<std::size_t>(count, ntt_table_->size());
+            std::vector<Root64> host(k);
+
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(host.data(),
+                                    ntt_table_->data(),
+                                    k * sizeof(Root64),
+                                    cudaMemcpyDeviceToHost,
+                                    stream));
+            HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::cout << "[ntt_table] ";
+            for (std::size_t i = 0; i < k; ++i) {
+                std::cout << host[i] << (i + 1 == k ? '\n' : ' ');
+            }
+        };
+
+
 
     private:
         HEContext<Scheme::RTF>& context_;   
@@ -204,7 +236,7 @@ namespace heongpu
         std::shared_ptr<DeviceVector<Root64>> plain_intt_tables_;
         std::shared_ptr<DeviceVector<Data64>> encoding_location_;
 
-        
+        Data64 plain_psi_;
         // hera
         int round_ = 2;
         size_t rc_vec_size_ = 0;
