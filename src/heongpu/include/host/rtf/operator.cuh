@@ -1220,13 +1220,25 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
         
-        __host__ heongpu::Ciphertext<heongpu::Scheme::RTF> multiply_matrix_bsgs(
+        __host__ Ciphertext<Scheme::RTF> multiply_matrix_bsgs(
             heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
             const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups,
             const std::vector<std::vector<int>>& shifts,
-            heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
-            const ExecutionOptions& opt = ExecutionOptions());
+            Galoiskey<heongpu::Scheme::RTF>& galois_key,
+            const ExecutionOptions& opt = ExecutionOptions()
+        );
 
+        __host__ void conjugate(
+            Ciphertext<Scheme::RTF>& input1,
+            Ciphertext<Scheme::RTF>& output,
+            Galoiskey<Scheme::RTF>& galois_key,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+        __host__ void conjugate_inplace(
+            Ciphertext<Scheme::RTF>& input1,
+            Galoiskey<Scheme::RTF>& galois_key,
+            const ExecutionOptions& options
+        );
 
         // private:
       protected:

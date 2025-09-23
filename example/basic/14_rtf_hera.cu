@@ -18,7 +18,7 @@ int main(int argc, char* argv[])
 
     // --- Context / params ---
     heongpu::HEContext<Scheme> context(
-        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_II);
 
     size_t poly_modulus_degree = 32768; // divisible by 16
     context.set_poly_modulus_degree(poly_modulus_degree);

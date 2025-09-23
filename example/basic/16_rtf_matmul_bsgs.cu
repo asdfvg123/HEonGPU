@@ -15,10 +15,10 @@ int main(int argc, char* argv[])
     heongpu::HEContext<Scheme> context(
         heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
 
-    size_t poly_modulus_degree = 4096;
+    size_t poly_modulus_degree = 8192;
     context.set_poly_modulus_degree(poly_modulus_degree);
     context.set_coeff_modulus_default_values(1);
-    int plain_modulus = 786433;
+    int plain_modulus = 65537;
     context.set_plain_modulus(plain_modulus);
     context.generate();
     context.print_parameters();
@@ -33,36 +33,89 @@ int main(int argc, char* argv[])
     keygen.generate_relin_key(relin_key, secret_key);
     
     std::cout << "Generating Galois keys for BSGS..." << std::endl;
-    // Calculate the required BSGS parameters
-    const int row_len = poly_modulus_degree >> 1;
-    const size_t g2_unsigned = static_cast<size_t>(ceil(sqrt(row_len)));
-    const int g2_signed = static_cast<int>(g2_unsigned);
-    std::cout << "BSGS parameters: g2 = " << g2_signed << std::endl;
-    
-    // g2 as above
-    std::set<int> required_shifts;
-    required_shifts.insert(1); // for building baby steps by +1 repeatedly
+    const int N = poly_modulus_degree;
+    const int g2_signed = static_cast<int>(ceil(sqrt(N/2)));
+    const int N_div_2 = N / 2;
 
-    // 2. Collect all unique diagonal shifts from all matrices that will be used.
+
+    std::cout << "BSGS parameters: g2 = " << g2_signed << std::endl;
+        // --- Correct Key Generation Logic for multiply_matrix_bsgs ---
+    std::cout << "Generating Galois keys for BSGS..." << std::endl;
+
+
+    // Define all unique diagonal shifts from all matrices you will use
     std::vector<int> diags_M1 = {0, 2, -2};
     std::vector<int> diags_M2 = {0, 1};
-    // collect all diagonals you'll use (unique)
+    std::vector<int> diags_M3 = {0, 66};
+    std::cout << "N/2 " << N/2 << std::endl;
+
     std::set<int> unique_diag_shifts;
     unique_diag_shifts.insert(diags_M1.begin(), diags_M1.end());
     unique_diag_shifts.insert(diags_M2.begin(), diags_M2.end());
+    unique_diag_shifts.insert(diags_M3.begin(), diags_M3.end());
 
+    std::set<int> required_row_rotations;
+    bool needs_conjugation_key = false;
 
-    // for each diagonal shift s, we will rotate by i*g2 in the giant step
-    for (int s : unique_diag_shifts) {
-        int j = (s % g2_signed + g2_signed) % g2_signed;
-        int i = (s - j) / g2_signed;
-        required_shifts.insert(i * g2_signed);  // could be negative, that’s fine
+    // 1. Determine keys needed for baby steps
+    // The function directly rotates by `j` for j in [1, g2-1].
+    for (int j = 1; j < g2_signed; ++j) {
+        required_row_rotations.insert(j);
     }
 
-    // build galois keys for {1} and all distinct {i*g2}
-    std::vector<int> all_required(required_shifts.begin(), required_shifts.end());
-    heongpu::Galoiskey<Scheme> galois_key(context, all_required);
+    // 2. Determine the set of unique giant rotation amounts that will be performed
+    std::set<int> unique_giant_rotations;
+    for (int s_orig : unique_diag_shifts) {
+        // Mimic the exact normalization from the function's accumulation loop
+        int effective_s = s_orig % N;
+        if (effective_s > N_div_2) {
+            effective_s -= N;
+        } else if (effective_s < -N_div_2) {
+            effective_s += N;
+        }
+
+        // Mimic the BSGS decomposition to find the giant step index 'i'
+        int j = (effective_s % g2_signed + g2_signed) % g2_signed;
+        int i = (effective_s - j) / g2_signed;
+        
+        int giant_rot = i * g2_signed;
+        if (giant_rot != 0) {
+            unique_giant_rotations.insert(giant_rot);
+        }
+    }
+
+    // 3. For each unique giant rotation, determine the final key needed
+    for (int rot : unique_giant_rotations) {
+        // Mimic the exact normalization from the function's final combination loop
+        long long effective_rot = static_cast<long long>(rot) % N;
+        if (effective_rot < 0) {
+            effective_rot += N;
+        }
+
+        if (N % 2 == 0 && effective_rot == N_div_2) {
+            // This rotation requires rotate_columns, so we need the conjugation key
+            needs_conjugation_key = true;
+        } else {
+            // This rotation uses rotate_rows_inplace, find its minimal representation
+            if (effective_rot > N_div_2) {
+                effective_rot -= N;
+            }
+            if (effective_rot != 0) {
+                required_row_rotations.insert(static_cast<int>(effective_rot));
+            }
+        }
+    }
+
+    // 4. Combine all keys into the final list for the key generator
+    std::vector<int> all_required_keys(required_row_rotations.begin(), required_row_rotations.end());
+    if (needs_conjugation_key) {
+        // Add the special value (-1 is common) to request the conjugation key
+        all_required_keys.push_back(-1); 
+    }
+    
+    heongpu::Galoiskey<Scheme> galois_key(context, all_required_keys);
     keygen.generate_galois_key(galois_key, secret_key);
+    // --- END OF KEY GENERATION LOGIC ---
 
     heongpu::HEEncoder<Scheme> encoder(context);
     heongpu::HEEncryptor<Scheme> encryptor(context, public_key);
@@ -70,11 +123,11 @@ int main(int argc, char* argv[])
     heongpu::HEArithmeticOperator<Scheme> operators(context, encoder);
 
     // Initial Vector
-    std::vector<uint64_t> message(poly_modulus_degree, 0ULL);
-    message[0] = 1ULL;
-    message[1] = 2ULL;
-    message[2] = 3ULL;
-    message[3] = 4ULL;
+    std::vector<uint64_t> message(N, 1ULL);
+    for(int u = 0; u < N; u++)
+        message[u] = u % 17;
+
+    // message[0] = 1ULL; message[1] = 2ULL; message[2] = 3ULL; message[3] = 4ULL;
     std::cout << "Initial vector:" << std::endl;
     display_matrix(message, 0);
 
@@ -83,66 +136,49 @@ int main(int argc, char* argv[])
     heongpu::Ciphertext<Scheme> C1(context);
     encryptor.encrypt(C1, P1);
 
-    /********************************************************************************
-     * MATRIX DEFINITIONS
-     ********************************************************************************/
-    
-    // --- Define Matrix 1 (M1) ---
-    std::vector<uint64_t> m1_diag0(poly_modulus_degree, 3ULL);
-    std::vector<uint64_t> m1_diag2(poly_modulus_degree, 1ULL);
-    std::vector<uint64_t> m1_diag_minus2(poly_modulus_degree, 5ULL);
+    // Matrix Definitions
+    std::vector<uint64_t> m3_diag0(N, 4ULL);
+    std::vector<uint64_t> m3_diag_N_div_4(N, 2ULL);
+    for(int u = 0; u < N; u++)
+        m3_diag_N_div_4[u] = (u-g2_signed) % 19;
 
-    // --- Define Matrix 2 (M2) ---
-    std::vector<uint64_t> m2_diag0(poly_modulus_degree, 2ULL);
-    std::vector<uint64_t> m2_diag1(poly_modulus_degree, 7ULL);
+    // std::vector<uint64_t> m3_diag_N_div_2(N, 6ULL);
 
 
     /********************************************************************************
-     * HOMOMORPHIC CALCULATION (BSGS)
+     * NEW TEST CASE: M3 (diagonals 0, N/2) * V
      ********************************************************************************/
-    std::cout << "\n--- Calculating with multiply_matrix_bsgs ---" << std::endl;
-    
-    // Prepare diagonals for M1
-    heongpu::DeviceVector<Data64> concat_diags_M1(diags_M1.size() * poly_modulus_degree);
+    std::cout << "\n--- New Test Case: Calculating with M3 (diagonals 0, N/2) using BSGS ---" << std::endl;
+
+    heongpu::DeviceVector<Data64> concat_diags_M3(diags_M3.size() * N);
     {
-        heongpu::Plaintext<Scheme> p_m1_d0(context), p_m1_d2(context), p_m1_dm2(context);
-        encoder.encode(p_m1_d0, m1_diag0);
-        encoder.encode(p_m1_d2, m1_diag2);
-        encoder.encode(p_m1_dm2, m1_diag_minus2);
-        cudaMemcpy(concat_diags_M1.data(), p_m1_d0.data(), poly_modulus_degree * sizeof(Data64), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(concat_diags_M1.data() + poly_modulus_degree, p_m1_d2.data(), poly_modulus_degree * sizeof(Data64), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(concat_diags_M1.data() + (2 * poly_modulus_degree), p_m1_dm2.data(), poly_modulus_degree * sizeof(Data64), cudaMemcpyDeviceToDevice);
+        heongpu::Plaintext<Scheme> p_m3_d0(context), p_m3_dNdiv2(context), p_m3_dNdiv4(context);
+        encoder.encode(p_m3_d0, m3_diag0);
+        encoder.encode(p_m3_dNdiv4, m3_diag_N_div_4);
+        // encoder.encode(p_m3_dNdiv2, m3_diag_N_div_2);
+
+        cudaMemcpy(concat_diags_M3.data(), p_m3_d0.data(), N * sizeof(Data64), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(concat_diags_M3.data() + N, p_m3_dNdiv4.data(), N * sizeof(Data64), cudaMemcpyDeviceToDevice);
+        // cudaMemcpy(concat_diags_M3.data() + N*2, p_m3_dNdiv2.data(), N * sizeof(Data64), cudaMemcpyDeviceToDevice);
+
     }
 
-    // Prepare diagonals for M2
-    heongpu::DeviceVector<Data64> concat_diags_M2(diags_M2.size() * poly_modulus_degree);
-    {
-        heongpu::Plaintext<Scheme> p_m2_d0(context), p_m2_d1(context);
-        encoder.encode(p_m2_d0, m2_diag0);
-        encoder.encode(p_m2_d1, m2_diag1);
-        cudaMemcpy(concat_diags_M2.data(), p_m2_d0.data(), poly_modulus_degree * sizeof(Data64), cudaMemcpyDeviceToDevice);
-        cudaMemcpy(concat_diags_M2.data() + poly_modulus_degree, p_m2_d1.data(), poly_modulus_degree * sizeof(Data64), cudaMemcpyDeviceToDevice);
-    }
-    
-    // Structure for BSGS function
-    std::vector<std::vector<heongpu::DeviceVector<Data64>>> matrix_groups_for_bsgs;
-    matrix_groups_for_bsgs.push_back({std::move(concat_diags_M1)});
-    matrix_groups_for_bsgs.push_back({std::move(concat_diags_M2)});
+    std::vector<std::vector<heongpu::DeviceVector<Data64>>> matrix_groups_for_bsgs_M3;
+    matrix_groups_for_bsgs_M3.push_back({std::move(concat_diags_M3)});
+    std::vector<std::vector<int>> shifts_for_bsgs_M3 = {diags_M3};
 
-    std::vector<std::vector<int>> shifts_for_bsgs = {diags_M1, diags_M2};
-    
-    heongpu::Ciphertext<Scheme> C_result_bsgs = operators.multiply_matrix_bsgs(
-        C1, matrix_groups_for_bsgs, shifts_for_bsgs, galois_key);
+    heongpu::Ciphertext<Scheme> C_result_bsgs_M3 = operators.multiply_matrix_bsgs(
+        C1, matrix_groups_for_bsgs_M3, shifts_for_bsgs_M3, galois_key);
 
-    std::vector<uint64_t> vec_result_bsgs;
+    std::vector<uint64_t> vec_result_bsgs_M3;
     {
         heongpu::Plaintext<Scheme> P_result(context);
-        decryptor.decrypt(P_result, C_result_bsgs);
-        encoder.decode(vec_result_bsgs, P_result);
+        decryptor.decrypt(P_result, C_result_bsgs_M3);
+        encoder.decode(vec_result_bsgs_M3, P_result);
     }
-    std::cout << "Result from BSGS function:" << std::endl;
+    std::cout << "Result from BSGS function with M3 (M3*v):" << std::endl;
     for(int i = 0; i < 128; ++i) {
-        std::cout << vec_result_bsgs[i] << " ";
+        std::cout << vec_result_bsgs_M3[i] << " ";
         if (i % 16 == 15) std::cout << "\n";
     }
     std::cout << std::endl;
