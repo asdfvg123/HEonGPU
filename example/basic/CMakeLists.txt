@@ -22,8 +22,6 @@ set(EXECUTABLES
     14_rtf_hera 14_rtf_hera.cu
     15_rtf_fv_slot2coeff 15_rtf_fv_slot2coeff.cu
     16_rtf_matmul_bsgs 16_rtf_matmul_bsgs.cu
-    17_rtf_matmul_bsgs2 17_rtf_matmul_bsgs2.cu
-
 
 )
 

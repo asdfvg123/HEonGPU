@@ -442,7 +442,6 @@ namespace heongpu
 
     }
 
-    // Rotate a subrange [start, start+len) to the RIGHT by k (mod len)
     static inline void rotate_subrange_right_inplace(std::vector<uint64_t>& v,
                                                     int start, int len, int k)
     {
@@ -451,45 +450,36 @@ namespace heongpu
         if (k == 0) return;
         auto first = v.begin() + start;
         auto last  = first + len;
-        // right-rotate by k == left-rotate by (len - k)
         std::rotate(first, last - k, last);
     }
 
-    static inline void pre_rotate_diagonals_correctly(std::vector<uint64_t>& v, int H, int k)
+    static inline void pre_rotate_diagonals(std::vector<uint64_t>& v, int H, int k)
     {
         const int N = static_cast<int>(v.size());
         if (N == 0 || H <= 0 || 2 * H != N || k == 0) return;
         
-        // 1. k를 '절반 교환 횟수'와 '그룹 내 회전량'으로 분해합니다.
         const int num_swaps = k / H;
         const int small_rotation = k % H;
 
-        // 2. '절반 교환'을 수행합니다. 교환 횟수가 홀수일 때만 수행하면 됩니다.
         if ((num_swaps % 2) != 0) {
             auto first_half_begin = v.begin();
             auto second_half_begin = v.begin() + H;
-            // v의 첫 절반과 두 번째 절반을 맞바꿉니다.
             std::rotate(first_half_begin, second_half_begin, v.end());
         }
 
-        // 3. 남은 '그룹 내 회전'을 각 절반에 독립적으로 적용합니다.
         if (small_rotation != 0) {
-            // row 0: [0, H)
             rotate_subrange_right_inplace(v, 0, H, small_rotation);
-            // row 1: [H, N)
             rotate_subrange_right_inplace(v, H, H, small_rotation);
         }
     }
     static inline int row_aligned_col_idx(int i, int s, int H)
     {
-        const int row_base = (i < H) ? 0 : H;        // which half i is in
-        const int in_row   = i - row_base;           // 0..H-1 inside its half
+        const int row_base = (i < H) ? 0 : H;
+        const int in_row   = i - row_base;
 
         if (s < H) {
-            // group 0: stay in the same half
             return row_base + ((in_row + s) % H);
         } else {
-            // group 1: after rotate_columns (half-swap), read from the other half
             const int r = s - H;
             const int other_base = (row_base == 0) ? H : 0;
             return other_base + ((in_row + r) % H);
@@ -499,6 +489,8 @@ namespace heongpu
     __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::gen_FV_S2C_Matrix(
         const ExecutionOptions& options)
     {
+        if(is_S2C_initialized_) return; 
+        
         cudaStream_t stream = options.stream_;
         const int N    = (int)context_.n;
         const int H    = N >> 1;
@@ -507,17 +499,14 @@ namespace heongpu
         const uint64_t t   = plain_modulus_.value;
         const uint64_t psi = plain_psi_;
 
-        // ψ^k table, k=0..2N-1
-        std::vector<uint64_t> psi_pow(twoN);
-        psi_pow[0] = 1ULL;
+        psi_pow_.resize(twoN);
+        psi_pow_[0] = 1ULL;
         for (int k = 1; k < twoN; ++k)
-            psi_pow[k] = mul_mod_u128(psi_pow[k - 1], psi, t);
+            psi_pow_[k] = mul_mod_u128(psi_pow_[k - 1], psi, t);
 
-        // BSGS param
         const int g2 = (int)std::ceil(std::sqrt((double)H));
 
-        // Split into two groups: [0..H-1], [H..N-1]
-        s2c_matrix_diagonals_.assign(2, {});     // [group0, group1]
+        s2c_matrix_diagonals_.assign(2, {});     
         s2c_matrix_shifts_.assign(2, {});
 
         s2c_matrix_shifts_[0].resize(H);
@@ -532,59 +521,48 @@ namespace heongpu
         heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(context_);
         std::vector<uint64_t> diag_slots(N);
 
-        const uint64_t generator = 3;
+        const uint64_t generator = generator_;
         std::vector<uint64_t> gen_pow(N);
 
-        uint64_t pos = 1ULL; // g^i 값을 순차적으로 저장할 변수
+        uint64_t pos = 1ULL; 
 
-        // gen_pow 배열의 앞 N/2 채우기
         for (int i = 0; i < N / 2; ++i) {
             gen_pow[i] = pos;
-            // 다음 g^i 값을 계산
             pos = (pos * generator) % twoN;
         }
 
-        // gen_pow 배열의 뒤 N/2 채우기 (켤레 값 사용)
         for (int i = N / 2; i < N; ++i) {
             gen_pow[i] = twoN - pos;
-            // pos 값은 계속해서 g^i 시퀀스를 따라 업데이트
             pos = (pos * generator) % twoN;
         }
         for (int s = 0; s < N; ++s)
         {
-            // Build the row-aligned diagonal for shift s
             for (int i = 0; i < N; ++i) {
-                const int j_col = row_aligned_col_idx(i, s, H);  // <-- key change
+                const int j_col = row_aligned_col_idx(i, s, H); 
 
-                // Negacyclic DFT-style exponent: e = j * (2i + 1) mod 2N
-                const uint64_t e = (static_cast<uint64_t>(j_col) *
-                                    gen_pow[i])
+                const uint64_t e = (static_cast<uint64_t>(j_col) * gen_pow[i])
                                 % static_cast<uint64_t>(twoN);
 
-                diag_slots[i] = psi_pow[static_cast<size_t>(e)];
-                // (If you’re not building an FV/NTT-based matrix, plug your M[i,j_col] here.)
+                diag_slots[i] = psi_pow_[static_cast<size_t>(e)];
             }
-            // --- BSGS pre-alignment: RIGHT by giant = floor(r/g2)*g2 ---
-            int r = (s < H) ? s : (s - H);     // 0..H-1
+            int r = (s < H) ? s : (s - H);
             int j = r % g2;
             int i_big = (r - j) / g2;
             int giant = i_big * g2;
 
-            pre_rotate_diagonals_correctly(diag_slots, H, giant);
-            // rotate_slots_right_inplace(diag_slots, giant);  // positive = RIGHT
+            pre_rotate_diagonals(diag_slots, H, giant);
 
-            // encode & copy to the correct group blob (group-local k)
             encoder_.encode(pt_diag, diag_slots, options);
 
             if (s < H) {
-                const size_t k = (size_t)s; // group0-local index
+                const size_t k = (size_t)s; 
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                     blob0.data() + k * (size_t)N,
                     pt_diag.data(),
                     (size_t)N * sizeof(Data64),
                     cudaMemcpyDeviceToDevice, stream));
             } else {
-                const size_t k = (size_t)(s - H); // group1-local index
+                const size_t k = (size_t)(s - H); 
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                     blob1.data() + k * (size_t)N,
                     pt_diag.data(),
@@ -593,11 +571,12 @@ namespace heongpu
             }
         }
 
-        // Commit blobs
         s2c_matrix_diagonals_[0].clear();
         s2c_matrix_diagonals_[1].clear();
         s2c_matrix_diagonals_[0].push_back(std::move(blob0));
         s2c_matrix_diagonals_[1].push_back(std::move(blob1));
+        
+        is_S2C_initialized_ = true;
 
         if (stream != cudaStreamDefault)
             cudaStreamSynchronize(stream);
@@ -608,6 +587,9 @@ namespace heongpu
         heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
         const ExecutionOptions& options)
     {
+        if (!is_S2C_initialized_) {
+            throw std::invalid_argument("S2C matrix not initialized; call gen_FV_S2C_Matrix() first.");
+        }
         if (ct_in.in_ntt_domain_) {
             operator_.transform_from_ntt_inplace(ct_in, options);
         }
