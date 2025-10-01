@@ -1228,18 +1228,6 @@ namespace heongpu
             const ExecutionOptions& opt = ExecutionOptions()
         );
 
-        __host__ void conjugate(
-            Ciphertext<Scheme::RTF>& input1,
-            Ciphertext<Scheme::RTF>& output,
-            Galoiskey<Scheme::RTF>& galois_key,
-            const ExecutionOptions& options = ExecutionOptions()
-        );
-        __host__ void conjugate_inplace(
-            Ciphertext<Scheme::RTF>& input1,
-            Galoiskey<Scheme::RTF>& galois_key,
-            const ExecutionOptions& options
-        );
-
         // private:
       protected:
         __host__ void add_plain_bfv(Ciphertext<Scheme::RTF>& input1,
@@ -1446,6 +1434,7 @@ namespace heongpu
         std::shared_ptr<DeviceVector<int>> I_j_;
         std::shared_ptr<DeviceVector<int>> I_location_;
         std::shared_ptr<DeviceVector<int>> Sk_pair_;
+
 
         /////////
 

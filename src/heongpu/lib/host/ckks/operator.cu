@@ -2526,7 +2526,6 @@ namespace heongpu
             relinearize_inplace(cipher_taylor, relin_key, options);
             rescale_inplace(cipher_taylor, options);
         }
-
         return cipher_taylor;
     }
 
@@ -3952,6 +3951,150 @@ namespace heongpu
         StoC_results.scale_ = scale_boot_;
 
         return StoC_results;
+    }
+
+    
+    __host__ Ciphertext<Scheme::CKKS>
+    HEArithmeticOperator<Scheme::CKKS>::regular_halfbootstrapping(
+        Ciphertext<Scheme::CKKS>& input1, Galoiskey<Scheme::CKKS>& galois_key,
+        Relinkey<Scheme::CKKS>& relin_key, const ExecutionOptions& options)
+    {
+        if (!boot_context_generated_)
+        {
+            throw std::invalid_argument(
+                "Bootstrapping operation can not be performed before "
+                "generating Bootstrapping parameters!");
+        }
+
+        // Raise modulus
+        int current_decomp_count = Q_size_ - input1.depth_;
+        if (current_decomp_count != 1)
+        {
+            throw std::logic_error("Ciphertexts leveled should be at max!");
+        }
+
+        ExecutionOptions options_inner =
+            ExecutionOptions()
+                .set_stream(options.stream_)
+                .set_storage_type(storage_type::DEVICE)
+                .set_initial_location(true);
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = n_inverse_->data(),
+            .stream = options.stream_};
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = options.stream_};
+        
+        std::cout << "here 1 : " << input1.scale() << std::endl;
+
+        if(!input1.in_ntt_domain_){
+            input1.in_ntt_domain_ = true;
+            gpuntt::GPU_NTT_Inplace(input1.data(), ntt_table_->data(),
+                                    modulus_->data(), cfg_ntt, 2, 1);
+        }
+
+        DeviceVector<Data64> input_intt_poly(2 * n, options.stream_);
+        input_storage_manager(
+            input1,
+            [&](Ciphertext<Scheme::CKKS>& input1_)
+            {
+                gpuntt::GPU_NTT(input1.data(), input_intt_poly.data(),
+                                intt_table_->data(), modulus_->data(), cfg_intt,
+                                2, 1);
+            },
+            options, false);
+
+        std::cout << "here bootstrap scale_boot : " << scale_boot_ << std::endl;
+        Ciphertext<Scheme::CKKS> c_raised =
+            operator_ciphertext(scale_boot_, options_inner.stream_); // c_raised has scale scale_boot_
+        mod_raise_kernel<<<dim3((n >> 8), Q_size_, 2), 256, 0,
+                           options_inner.stream_>>>(
+            input_intt_poly.data(), c_raised.data(), modulus_->data(), n_power);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+
+        gpuntt::GPU_NTT_Inplace(c_raised.data(), ntt_table_->data(),
+                                modulus_->data(), cfg_ntt, 2 * Q_size_,
+                                Q_size_);
+
+        // Coeff to slot
+        std::vector<heongpu::Ciphertext<Scheme::CKKS>> enc_results =
+            coeff_to_slot(c_raised, galois_key, options_inner); // c_raised
+
+        // Exponentiate
+        Ciphertext<Scheme::CKKS> ciph_neg_exp0 =
+            operator_ciphertext(0, options_inner.stream_);
+            
+
+        Ciphertext<Scheme::CKKS> ciph_exp0 =
+            exp_scaled(enc_results[0], relin_key, options_inner);
+
+
+
+        Ciphertext<Scheme::CKKS> ciph_neg_exp1 =
+            operator_ciphertext(0, options_inner.stream_);
+        Ciphertext<Scheme::CKKS> ciph_exp1 =
+            exp_scaled(enc_results[1], relin_key, options_inner);
+
+
+
+        // Compute sine
+        Ciphertext<Scheme::CKKS> ciph_sin0 =
+            operator_ciphertext(0, options_inner.stream_);
+        conjugate(ciph_exp0, ciph_neg_exp0, galois_key,
+                  options_inner); // conjugate
+        sub(ciph_exp0, ciph_neg_exp0, ciph_sin0, options_inner);
+
+        Ciphertext<Scheme::CKKS> ciph_sin1 =
+            operator_ciphertext(0, options_inner.stream_);
+        conjugate(ciph_exp1, ciph_neg_exp1, galois_key,
+                  options_inner); // conjugate
+        sub(ciph_exp1, ciph_neg_exp1, ciph_sin1, options_inner);
+
+
+
+        // Scale
+        current_decomp_count = Q_size_ - ciph_sin0.depth_;
+        cipherplain_multiplication_kernel<<<dim3((n >> 8), current_decomp_count,
+                                                 2),
+                                            256, 0, options_inner.stream_>>>(
+            ciph_sin0.data(), encoded_complex_minus_iscale_.data(),
+            ciph_sin0.data(), modulus_->data(), n_power);
+        ciph_sin0.scale_ = ciph_sin0.scale_ * scale_boot_;
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        ciph_sin0.rescale_required_ = true;
+        rescale_inplace(ciph_sin0, options_inner);
+
+
+        current_decomp_count = Q_size_ - ciph_sin1.depth_;
+        cipherplain_multiplication_kernel<<<dim3((n >> 8), current_decomp_count,
+                                                 2),
+                                            256, 0, options_inner.stream_>>>(
+            ciph_sin1.data(), encoded_complex_minus_iscale_.data(),
+            ciph_sin1.data(), modulus_->data(), n_power);
+        ciph_sin1.scale_ = ciph_sin1.scale_ * scale_boot_;
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        ciph_sin1.rescale_required_ = true;
+        rescale_inplace(ciph_sin1, options_inner);
+    
+        ciph_sin0.scale_ = scale_boot_;
+        return ciph_sin0;
+
+        // Slot to coeff
+        // Ciphertext<Scheme::CKKS> StoC_results =
+        //     slot_to_coeff(ciph_sin0, ciph_sin1, galois_key, options_inner);
+        // StoC_results.scale_ = scale_boot_;
+
+        // return StoC_results;
     }
 
     __host__ Ciphertext<Scheme::CKKS>

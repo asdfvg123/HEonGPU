@@ -27,6 +27,7 @@ namespace heongpu
         template <Scheme S> friend class HEKeyGenerator;
         template <Scheme S> friend class HEDecryptor;
         template <Scheme S> friend class HEMultiPartyManager;
+        friend class Secretkey<Scheme::CKKS>;
 
         template <typename T, typename F>
         friend void input_storage_manager(T& object, F function,

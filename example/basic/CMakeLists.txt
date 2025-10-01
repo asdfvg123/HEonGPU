@@ -22,7 +22,8 @@ set(EXECUTABLES
     14_rtf_hera 14_rtf_hera.cu
     15_rtf_fv_slot2coeff 15_rtf_fv_slot2coeff.cu
     16_rtf_matmul_bsgs 16_rtf_matmul_bsgs.cu
-
+    17_rtf_transcipher 17_rtf_transcipher.cu
+    18_rtf_moddown 18_rtf_moddown.cu
 )
 
 function(add_example exe source)

@@ -6,6 +6,7 @@ namespace heongpu
 {
     __host__
     HEHERA<Scheme::RTF>::HEHERA(HEContext<Scheme::RTF>& context,
+                                HEContext<Scheme::CKKS>& contextckks,
                                 HEEncoder<Scheme::RTF>& encoder,
                                 HEEncryptor<Scheme::RTF>& encryptor,
                                 HEOperator<Scheme::RTF>& op,
@@ -14,7 +15,8 @@ namespace heongpu
                                 const ExecutionOptions& options
                             )
         : 
-        context_(context), 
+        contextbfv_(context), 
+        contextckks_(contextckks), 
         encoder_(encoder), 
         encryptor_(encryptor), 
         operator_(op), 
@@ -179,7 +181,10 @@ namespace heongpu
 
 
         // hera setup
+        gen_FV_moddown_params();
+
         plain_psi_ = context.plain_psi_;
+        messageScaling_ = plain_modulus_.value / message_ratio_;
         
         rc_vec_size_ = static_cast<size_t>(round_ + 1) * n;
         // initialize IC
@@ -322,7 +327,7 @@ namespace heongpu
                                     .set_initial_location(true);
 
         for (int r = 0; r < round_+1; ++r) {
-            Ciphertext<Scheme::RTF> ct(context_);           // own buffers
+            Ciphertext<Scheme::RTF> ct(contextbfv_);           // own buffers
             ct.store_in_device(options.stream_);
             operator_.multiply_plain(key, rcPt[r], ct, opt);
             rckCt.emplace_back(std::move(ct));
@@ -335,7 +340,7 @@ namespace heongpu
         Ciphertext<Scheme::RTF>& key,
         const ExecutionOptions& options)
     {
-        Ciphertext<Scheme::RTF> result(context_);
+        Ciphertext<Scheme::RTF> result(contextbfv_);
         precompute(key, options);
 
         // ark
@@ -391,7 +396,8 @@ namespace heongpu
     }
 
     __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::cube(
-        Ciphertext<Scheme::RTF>& input, Ciphertext<Scheme::RTF>& output,
+        Ciphertext<Scheme::RTF>& input, 
+        Ciphertext<Scheme::RTF>& output,
         const ExecutionOptions& options)
     {
         cudaStream_t stream = options.stream_;
@@ -492,7 +498,7 @@ namespace heongpu
         if(is_S2C_initialized_) return; 
         
         cudaStream_t stream = options.stream_;
-        const int N    = (int)context_.n;
+        const int N    = (int)contextbfv_.n;
         const int H    = N >> 1;
         const int twoN = 2 * N;
 
@@ -518,7 +524,7 @@ namespace heongpu
         heongpu::DeviceVector<Data64> blob0((size_t)N * H, stream);
         heongpu::DeviceVector<Data64> blob1((size_t)N * (N - H), stream);
 
-        heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(context_);
+        heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(contextbfv_);
         std::vector<uint64_t> diag_slots(N);
 
         const uint64_t generator = generator_;
@@ -582,8 +588,7 @@ namespace heongpu
             cudaStreamSynchronize(stream);
     }
     
-    __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
-    HEHERA<heongpu::Scheme::RTF>::S2C_FV(
+    __host__ heongpu::Ciphertext<heongpu::Scheme::RTF> HEHERA<heongpu::Scheme::RTF>::S2C_FV(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
         const ExecutionOptions& options)
     {
@@ -604,6 +609,257 @@ namespace heongpu
             galois_key_,
             options
         );
+    }
+
+    __host__ heongpu::Plaintext<heongpu::Scheme::RTF> HEHERA<heongpu::Scheme::RTF>::vec2poly(
+        const std::vector<uint64_t>& input,
+        const ExecutionOptions& options
+    ){
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = 0;
+
+        const int      N = static_cast<int>(contextbfv_.n);
+        const uint64_t t = plain_modulus_.value;
+
+        std::vector<uint64_t> coeffs((size_t)N, 0ULL);
+        const size_t use_len = std::min(input.size(), (size_t)N);
+        for (size_t i = 0; i < use_len; ++i) coeffs[i] = t ? (input[i] % t) : input[i];
+
+        heongpu::DeviceVector<Data64> dev_coeffs;
+        dev_coeffs.resize(N, stream);
+
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            dev_coeffs.data(), coeffs.data(), (size_t)N * sizeof(uint64_t),
+            cudaMemcpyHostToDevice, stream));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        heongpu::Plaintext<heongpu::Scheme::RTF> pt(scheme_, dev_coeffs, /*is_ntt=*/false);
+        return pt;
+    }
+    
+    __host__ heongpu::Ciphertext<heongpu::Scheme::RTF> HEHERA<heongpu::Scheme::RTF>::eval_decrypt(
+        Ciphertext<Scheme::RTF>& keyCt, 
+        Plaintext<Scheme::RTF>& SKEpt,
+        const ExecutionOptions& options
+    ){
+        Ciphertext<Scheme::RTF> keyCT_neg(contextbfv_), result(contextbfv_);
+        operator_.negate(keyCt, keyCT_neg, options);
+        operator_.add_plain(keyCT_neg, SKEpt, result, options); // m + z - z
+
+        return result;
+    }
+    
+    __host__ heongpu::Ciphertext<heongpu::Scheme::CKKS>
+    HEHERA<heongpu::Scheme::RTF>::transcipher_bfv2ckks(
+        Ciphertext<Scheme::RTF>& ct_bfv,
+        const ExecutionOptions& options
+    )
+    {
+        cudaStream_t stream = options.stream_;
+        moddown_FV_inplace(ct_bfv, options);
+        std::cout << "here1" << std::endl;
+
+
+        if (contextbfv_.get_poly_modulus_degree() != contextckks_.get_poly_modulus_degree()) {
+            throw std::invalid_argument("Poly modulus degree mismatch between BFV and CKKS contexts.");
+        }
+
+        if (ct_bfv.coeff_modulus_count() > contextckks_.get_ciphertext_modulus_count()) {
+            throw std::invalid_argument("BFV ciphertext has more moduli than the CKKS context supports.");
+        }
+
+        Ciphertext<Scheme::CKKS> ct_ckks(contextckks_, options);
+        ct_ckks.coeff_modulus_count_ = ct_bfv.coeff_modulus_count();
+        ct_ckks.depth_ = contextckks_.get_ciphertext_modulus_count() - ct_bfv.coeff_modulus_count();
+        std::cout << "transciphering ckks depth :" << ct_ckks.depth_ << std::endl;
+
+        if (!ct_bfv.is_on_device()) {
+            ct_bfv.store_in_device(stream);
+        }
+
+        const size_t bfv_words = static_cast<size_t>(ct_bfv.ring_size())
+                            * static_cast<size_t>(ct_bfv.coeff_modulus_count())
+                            * static_cast<size_t>(ct_bfv.size());
+        if (ct_ckks.device_locations_.size() != bfv_words) {
+            ct_ckks.device_locations_.resize(bfv_words, stream);
+        }
+
+        const size_t bytes = bfv_words * sizeof(Data64);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            ct_ckks.device_locations_.data(),
+            ct_bfv.device_locations_.data(),
+            bytes,
+            cudaMemcpyDeviceToDevice,
+            stream
+        ));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // // ===== inline print (after BFV→CKKS copy) =====
+        // {
+        //     const int N          = ct_ckks.ring_size();
+        //     const int poly_count = ct_ckks.size();                 // usually 2
+        //     const int L          = ct_ckks.coeff_modulus_count();  // here likely 1
+
+        //     // device → host copy for printing
+        //     std::vector<Data64> host(bfv_words);
+        //     HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+        //         host.data(),
+        //         ct_ckks.device_locations_.data(),
+        //         bytes,
+        //         cudaMemcpyDeviceToHost,
+        //         stream));
+        //     HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        //     // prepare q-values (optional)
+        //     const auto& ckks_moduli = contextckks_.get_key_modulus(); // host-side vector<Modulus64>
+        //     std::vector<uint64_t> qvals(std::max(0, L));
+        //     for (int i = 0; i < L; ++i) qvals[i] = ckks_moduli[i].value;
+
+        //     print_ct_coeffs_inline(
+        //         "[CKKS after copy] ",
+        //         reinterpret_cast<const uint64_t*>(host.data()),
+        //         poly_count,
+        //         L,
+        //         N,
+        //         (L > 0 ? qvals.data() : nullptr),
+        //         /*max_print=*/32
+        //     );
+        // }
+        // // ==============================================
+
+        ct_ckks.in_ntt_domain_ = ct_bfv.in_ntt_domain();
+        ct_ckks.relinearization_required_ = ct_bfv.relinearization_required();
+
+        const auto& ckks_moduli = contextckks_.get_key_modulus();
+        const double q0 = static_cast<double>(ckks_moduli[0].value);
+        const double t  = static_cast<double>(contextbfv_.get_plain_modulus().value);
+
+        double initial_scale      = (q0 / t) * messageScaling_;
+        double log2_scale         = std::log2(initial_scale);
+        double rounded_log2_scale = std::round(log2_scale); // q0 / message_ratio_
+        ct_ckks.scale_ = std::exp2(rounded_log2_scale);
+        // ct_ckks.scale_ = 0;
+        
+        std::cout << "Initial scale set to: " << ct_ckks.scale_ << std::endl;
+        ct_ckks.rescale_required_    = false;
+        ct_ckks.ciphertext_generated_ = true;
+        ct_ckks.scheme_ = heongpu::scheme_type::ckks;
+        ct_ckks.ring_size_ = ct_bfv.ring_size_;
+        ct_ckks.cipher_size_ = ct_bfv.size();
+        
+        return ct_ckks;
+    }
+
+    __host__ void HEHERA<heongpu::Scheme::RTF>::moddown_FV_inplace(
+        Ciphertext<Scheme::RTF>& input,
+        const ExecutionOptions& options
+    )
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = input.stream();
+
+        // std::cout << "Performing FV moddown..." << std::endl;
+        // debug_print_ct_coeffs_bfv(input, *modulus_, stream);
+
+
+        if (input.in_ntt_domain())
+        {
+            throw std::invalid_argument("Ciphertext must be in coefficient form for moddown.");
+        }
+        if (input.coeff_modulus_count() <= 1) {
+            return;
+        }
+
+        input.store_in_device(stream);
+
+        const int N = input.ring_size();
+        const int poly_count = input.size();
+
+        DeviceVector<Data64> scratch_buffer(input.memory_size(), stream);
+        
+        Data64* d_ptr_in = input.data();
+        Data64* d_ptr_out = scratch_buffer.data();
+
+        int initial_L_plus_1 = input.coeff_modulus_count();
+
+        for (int L_plus_1 = initial_L_plus_1; L_plus_1 > 1; --L_plus_1) 
+        {
+            int current_L_idx = L_plus_1 - 1;
+            int target_L = current_L_idx;
+
+            size_t invq_base_idx = static_cast<size_t>(current_L_idx) * (current_L_idx - 1) / 2;
+
+            const int threads = 256;
+            const int blocks_x = (N + threads - 1) / threads;
+            dim3 grid(blocks_x, target_L, poly_count);
+            dim3 block(threads, 1, 1);
+
+            moddown_FV_kernel<<<grid, block, 0, stream>>>(
+                d_ptr_in,
+                d_ptr_out,
+                modulus_->data(),
+                qhalf_->data(),
+                invq_->data(),
+                n_power,
+                current_L_idx,
+                invq_base_idx);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            std::swap(d_ptr_in, d_ptr_out);
+        }
+        
+        const size_t final_size_words = static_cast<size_t>(poly_count) * 1 * N; 
+        
+        if (d_ptr_in != input.data()) {
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(input.data(), d_ptr_in,
+                                            final_size_words * sizeof(Data64),
+                                            cudaMemcpyDeviceToDevice, stream));
+        }
+
+        input.device_locations_.resize(final_size_words, stream);
+        input.coeff_modulus_count_ = 1; 
+
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        // std::cout << "FV moddown completed." << std::endl;
+        // debug_print_ct_coeffs_bfv(input, *modulus_, stream);
+
+        return;
+    }
+
+    __host__ void HEHERA<heongpu::Scheme::RTF>::gen_FV_moddown_params(
+        const ExecutionOptions& options
+    ){
+        cudaStream_t stream = options.stream_; 
+        std::cout << "Generating FV moddown parameters..." << std::endl;
+        
+        std::vector<Modulus64> host_modulus(Q_size_);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(host_modulus.data(), modulus_->data(),
+                                        Q_size_ * sizeof(Modulus64),
+                                        cudaMemcpyDeviceToHost, stream));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        std::vector<Data64> host_qhalf(Q_size_);
+        for (int i = 0; i < Q_size_; ++i) {
+            host_qhalf[i] = host_modulus[i].value >> 1 ;
+        }
+
+        // invq_ 계산 (Flattened 2D Array)
+        size_t invq_total_size = static_cast<size_t>(Q_size_) * (Q_size_ - 1) / 2;
+        std::vector<Data64> host_invq(invq_total_size);
+        
+        size_t flattened_idx = 0;
+        for (int i = 1; i < Q_size_; ++i) {
+            for (int j = 0; j < i; ++j) {
+                uint64_t q_i = host_modulus[i].value;
+                uint64_t q_j = host_modulus[j].value;
+                Data64 inv_result = modInverseHERA(q_i, q_j);
+
+                host_invq[flattened_idx++] = inv_result;
+            }
+        }
+
+        qhalf_ = std::make_shared<DeviceVector<Data64>>(host_qhalf, stream);
+        invq_ = std::make_shared<DeviceVector<Data64>>(host_invq, stream);
     }
 
 

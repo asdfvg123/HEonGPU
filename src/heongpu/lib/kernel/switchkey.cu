@@ -396,7 +396,63 @@ namespace heongpu
         output[index] = ct_0_sum;
         output[index + (current_rns_mod_count << n_power)] = ct_1_sum;
     }
+    __global__ void moddown_FV_kernel(
+        const Data64* __restrict__ input,   // [num_polys][L+1][N]
+        Data64* __restrict__ output,        // [num_polys][L][N]
+        const Modulus64* __restrict__ q,    // [L+1]
+        const Data64* __restrict__ qhalf,   // [L+1], floor(q/2)
+        const Data64* __restrict__ invq,    // per-step table: inv(q_L) mod q_j, j=0..L-1
+        int n_power,
+        int current_L_idx,                  // L index to drop (0-based, dropping the last: L)
+        size_t invq_base_idx)               // offset to this step's inv table
+    {
+        const int N   = 1 << n_power;
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= N) return;
 
+        const int j       = blockIdx.y;     // 0..current_L_idx-1
+        const int poly_id = blockIdx.z;     // 0..num_polys-1
+
+        // Offsets
+        const size_t in_stride  = static_cast<size_t>(current_L_idx + 1) * N;
+        const size_t out_stride = static_cast<size_t>(current_L_idx) * N;
+
+        const size_t base_in   = static_cast<size_t>(poly_id) * in_stride;
+        const size_t base_out  = static_cast<size_t>(poly_id) * out_stride;
+
+        // c_L (to be dropped)
+        const size_t off_L   = base_in + static_cast<size_t>(current_L_idx) * N + idx;
+        const Data64  cL     = input[off_L];
+
+        // Round-to-nearest (odd prime => '>' equals ties-up)
+        const Data64  round_bit = (cL > qhalf[current_L_idx]);
+
+        // Work on modulus q_j
+        const Modulus64 qj = q[j];
+
+        // [c_L]_qj
+        const Data64 cL_mod_qj = OPERATOR_GPU_64::reduce_forced(cL, qj);
+
+        // c_j
+        const size_t off_j = base_in + static_cast<size_t>(j) * N + idx;
+        Data64 v = input[off_j];
+
+        // v = (c_j - [c_L]_qj) mod q_j
+        v = OPERATOR_GPU_64::sub(v, cL_mod_qj, qj);
+
+        // v = v * inv(q_L) mod q_j
+        const Data64 inv_qL_mod_qj = invq[invq_base_idx + j];
+        v = OPERATOR_GPU_64::mult(v, inv_qL_mod_qj, qj);
+
+        // add rounding bit
+        v = OPERATOR_GPU_64::add(v, round_bit, qj);
+        v = OPERATOR_GPU_64::reduce_forced(v, qj);
+
+        // store
+        const size_t out_off = base_out + static_cast<size_t>(j) * N + idx;
+        output[out_off] = v;
+    }
+    
     __global__ void divide_round_lastq_kernel(Data64* input, Data64* ct,
                                               Data64* output,
                                               Modulus64* modulus, Data64* half,

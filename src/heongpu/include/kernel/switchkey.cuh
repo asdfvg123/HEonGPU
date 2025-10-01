@@ -36,6 +36,16 @@ namespace heongpu
         int current_decomp_mod_count, int current_rns_mod_count,
         int iteration_count1, int iteration_count2, int level, int n_power);
 
+    __global__ void moddown_FV_kernel(
+        const Data64* input,
+        Data64* output,
+        const Modulus64* q,
+        const Data64* qhalf,
+        const Data64* invq,
+        int n_power,
+        int current_L_idx,
+        size_t invq_base_idx);
+
     __global__ void
     divide_round_lastq_kernel(Data64* input, Data64* ct, Data64* output,
                               Modulus64* modulus, Data64* half,

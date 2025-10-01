@@ -11,7 +11,7 @@
 
 typedef unsigned long long Data64;
 constexpr auto Scheme = heongpu::Scheme::RTF;
-
+constexpr auto SchemeCKKS = heongpu::Scheme::CKKS;
 int main(int argc, char* argv[])
 {
     cudaSetDevice(0);
@@ -19,6 +19,8 @@ int main(int argc, char* argv[])
     // --- Context / params ---
     heongpu::HEContext<Scheme> context(
         heongpu::keyswitching_type::KEYSWITCHING_METHOD_II);
+
+
 
     size_t poly_modulus_degree = 32768; // divisible by 16
     context.set_poly_modulus_degree(poly_modulus_degree);
@@ -32,6 +34,12 @@ int main(int argc, char* argv[])
 
     context.generate();
     context.print_parameters();
+
+    heongpu::HEContext<SchemeCKKS> contextckks(
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
+    contextckks.set_poly_modulus_degree(poly_modulus_degree);
+    contextckks.set_coeff_modulus_bit_sizes({60, 30, 30, 30}, {60});
+    contextckks.generate();
 
     heongpu::HEKeyGenerator<Scheme> keygen(context);
     heongpu::Secretkey<Scheme> secret_key(context);
@@ -103,7 +111,7 @@ int main(int argc, char* argv[])
     encryptor.encrypt(C_keyhera, P_keyhera);
 
     heongpu::HEHERA<Scheme> hera(
-        context, encoder, encryptor, operators, galois_key, relin_key);
+        context, contextckks, encoder, encryptor, operators, galois_key, relin_key);
     
    
     auto icCt_ = hera.get_icCt();

@@ -17,6 +17,10 @@
 #include "rtf/evaluationkey.cuh"
 #include "rtf/operator.cuh"
 
+#include "ckks/context.cuh"
+#include "ckks/ciphertext.cuh"
+#include "ckks/operator.cuh"
+
 namespace heongpu
 {
 
@@ -32,14 +36,14 @@ namespace heongpu
          * @brief Construct a new HEHERA object with the given parameters.
          */
         __host__ HEHERA(HEContext<Scheme::RTF>& context,
-                         HEEncoder<Scheme::RTF>& encoder,
-                         HEEncryptor<Scheme::RTF>& encryptor,
-                         HEOperator<Scheme::RTF>& op,
-                         Galoiskey<Scheme::RTF>& galois_key,
-                         Relinkey<Scheme::RTF>& relin_key,
+                        HEContext<Scheme::CKKS>& contextckks,
+                        HEEncoder<Scheme::RTF>& encoder,
+                        HEEncryptor<Scheme::RTF>& encryptor,
+                        HEOperator<Scheme::RTF>& op,
+                        Galoiskey<Scheme::RTF>& galois_key,
+                        Relinkey<Scheme::RTF>& relin_key,
                         const ExecutionOptions& options = ExecutionOptions()
                         );
-
 
         HEHERA() = default;
         HEHERA(const HEHERA& copy) = default;
@@ -51,8 +55,10 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
 
-        __host__ void precompute(Ciphertext<Scheme::RTF>& key, 
-            const ExecutionOptions& options = ExecutionOptions());
+        __host__ void precompute(
+            Ciphertext<Scheme::RTF>& key, 
+            const ExecutionOptions& options = ExecutionOptions()
+        );
 
         __host__ Ciphertext<Scheme::RTF> gen_stream_key(
             // heongpu::DeviceVector<Data64>& nonce,
@@ -87,11 +93,34 @@ namespace heongpu
         );
         
         __host__ Ciphertext<Scheme::RTF> S2C_FV(
-            Ciphertext<Scheme::RTF>& ct_in,
+            Ciphertext<Scheme::RTF>& input,
             const ExecutionOptions& options = ExecutionOptions()
         );
 
+        __host__ Plaintext<Scheme::RTF> vec2poly(
+            const std::vector<uint64_t>& input,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
 
+        __host__ Ciphertext<Scheme::RTF> eval_decrypt(
+            Ciphertext<Scheme::RTF>& keyCt,
+            Plaintext<Scheme::RTF>& SKEpt,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ Ciphertext<Scheme::CKKS> transcipher_bfv2ckks(
+            Ciphertext<Scheme::RTF>& ct_bfv,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void gen_FV_moddown_params(
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ void moddown_FV_inplace(
+            Ciphertext<Scheme::RTF>& input,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
 
         __host__ heongpu::Ciphertext<Scheme::RTF> get_icCt(){
             return icCt_;
@@ -120,11 +149,194 @@ namespace heongpu
             return static_cast<uint64_t>((static_cast<__uint128_t>(a) * b) % m);
         }
 
+        int64_t extendedGCD_internal(int64_t a, int64_t b, int64_t& x, int64_t& y)
+        {
+            if (a == 0)
+            {
+                x = 0;
+                y = 1;
+                return b;
+            }
+
+            int64_t x1, y1;
+            int64_t gcd = extendedGCD_internal(b % a, a, x1, y1);
+
+            // ★★★ 이 계산은 x, y가 음수가 될 수 있어 반드시 signed 타입으로 수행되어야 합니다 ★★★
+            x = y1 - (b / a) * x1;
+            y = x1;
+
+            return gcd;
+        }
+
+        // 최종적으로 안전하게 사용할 수 있는 메인 함수
+        Data64 modInverseHERA(Data64 a, Data64 m)
+        {
+            int64_t x, y;
+            // 입력값을 안전하게 signed 타입으로 변환하여 계산
+            int64_t a_signed = static_cast<int64_t>(a);
+            int64_t m_signed = static_cast<int64_t>(m);
+
+            int64_t gcd = extendedGCD_internal(a_signed, m_signed, x, y);
+
+            if (gcd != 1)
+            {
+                // 역원이 존재하지 않음
+                return 0;
+            }
+            else
+            {
+                // 결과가 음수일 경우를 대비해 양수로 변환
+                // (x % m + m) % m 은 C++에서 음수 나머지를 처리하는 표준적인 방법입니다.
+                int64_t result_signed = (x % m_signed + m_signed) % m_signed;
+                return static_cast<Data64>(result_signed);
+            }
+        }
+
+
+        static void debug_print_ct_coeffs_bfv(
+            const heongpu::Ciphertext<heongpu::Scheme::RTF>& ct,
+            const DeviceVector<Modulus64>& device_moduli, // 보통 context의 *modulus_
+            cudaStream_t stream)
+        {
+            const int N          = ct.ring_size();
+            const int poly_count = ct.size();
+            const int L          = ct.coeff_modulus_count();
+
+            // 1) 남은 모듈러스 L개를 호스트로 복사
+            std::vector<Modulus64> host_modulus(L);
+            if (L > 0) {
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    host_modulus.data(), device_moduli.data(),
+                    L * sizeof(Modulus64),
+                    cudaMemcpyDeviceToHost, stream));
+                HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+            }
+
+            // 2) 계수 전체를 호스트 버퍼로 복사 (friend 접근으로 data 포인터 취득)
+            const size_t words = static_cast<size_t>(poly_count) * (L > 0 ? L : 1) * N;
+            const size_t bytes = words * sizeof(Data64);
+
+            std::vector<Data64> host(words);
+            if (ct.storage_type_ == storage_type::DEVICE) {
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    host.data(),
+                    ct.device_locations_.data(),   // friend access
+                    bytes,
+                    cudaMemcpyDeviceToHost, stream));
+                HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+            } else {
+                // HOST에 있으면 그대로 복사
+                std::memcpy(host.data(), ct.host_locations_.data(), bytes);
+            }
+
+            // 3) 너무 길어지는 출력 방지: 앞/뒤 일부만
+            constexpr int MAX_PRINT = 32;              // 필요 시 조절
+            const bool truncate = (N > MAX_PRINT);
+            const int head = truncate ? (MAX_PRINT / 2) : N;
+            const int tail = truncate ? (MAX_PRINT - head) : 0;
+
+            const int effL = (L > 0 ? L : 1);
+            for (int p = 0; p < poly_count; ++p) {
+                for (int ell = 0; ell < effL; ++ell) {
+                    if (L > 0) {
+                        printf("=== poly %d, q[%d] = %llu ===\n",
+                            p, ell, (unsigned long long)host_modulus[ell].value);
+                    } else {
+                        printf("=== poly %d, (L=0?) ===\n", p);
+                    }
+                    const Data64* base = host.data()
+                        + (static_cast<size_t>(p) * effL + ell) * N;
+
+                    if (!truncate) {
+                        for (int i = 0; i < N; ++i) {
+                            printf("%llu%c",
+                                (unsigned long long)base[i],
+                                (i + 1 == N ? '\n' : ' '));
+                        }
+                    } else {
+                        for (int i = 0; i < head; ++i)
+                            printf("%llu ", (unsigned long long)base[i]);
+                        printf("... ");
+                        for (int i = N - tail; i < N; ++i) {
+                            printf("%llu%c", (unsigned long long)base[i],
+                                (i + 1 == N ? '\n' : ' '));
+                        }
+                    }
+                }
+            }
+        }
+        inline void print_coeffs_block_inline(
+            const char* label,
+            const uint64_t* base,    // 블록 시작 포인터 (host)
+            int N,
+            int max_print = 32)
+        {
+            if (label && *label) std::printf("%s", label);
+
+            const bool truncate = (N > max_print);
+            const int head = truncate ? (max_print / 2) : N;
+            const int tail = truncate ? (max_print - head) : 0;
+
+            if (!truncate) {
+                for (int i = 0; i < N; ++i) {
+                    std::printf("%llu%c",
+                                (unsigned long long)base[i],
+                                (i + 1 == N ? '\n' : ' '));
+                }
+            } else {
+                for (int i = 0; i < head; ++i)
+                    std::printf("%llu ", (unsigned long long)base[i]);
+                std::printf("... ");
+                for (int i = N - tail; i < N; ++i) {
+                    std::printf("%llu%c",
+                                (unsigned long long)base[i],
+                                (i + 1 == N ? '\n' : ' '));
+                }
+            }
+        }
+
+        // host 버퍼 전체에서 (poly, modulus, coeff) 순서로 출력
+        inline void print_ct_coeffs_inline(
+            const char* tag,                   // 예: "[BFV after moddown]" 또는 "[CKKS after copy]"
+            const uint64_t* host,             // host.data()
+            int poly_count,                   // 보통 2 (c0, c1)
+            int L,                            // 남은 모듈러스 개수
+            int N,                            // 링 크기
+            const uint64_t* moduli_values,    // nullptr 허용. 있으면 q값도 출력
+            int max_print = 32)
+        {
+            const int effL = (L > 0 ? L : 1);
+
+            for (int p = 0; p < poly_count; ++p) {
+                for (int ell = 0; ell < effL; ++ell) {
+                    char header[256];
+                    if (moduli_values && L > 0) {
+                        std::snprintf(header, sizeof(header),
+                                    "%s poly %d, q[%d]=%llu\n",
+                                    (tag ? tag : ""), p, ell,
+                                    (unsigned long long)moduli_values[ell]);
+                    } else {
+                        std::snprintf(header, sizeof(header),
+                                    "%s poly %d, ell=%d\n",
+                                    (tag ? tag : ""), p, ell);
+                    }
+
+                    const uint64_t* base =
+                        host + (static_cast<size_t>(p) * effL + ell) * N;
+
+                    print_coeffs_block_inline(header, base, N, max_print);
+                }
+            }
+        }
     private:
-        HEContext<Scheme::RTF>& context_;   
+        HEContext<Scheme::RTF>& contextbfv_;   
+        HEContext<Scheme::CKKS>& contextckks_;
+
         HEEncoder<Scheme::RTF>& encoder_;  
         HEEncryptor<Scheme::RTF>& encryptor_; 
         HEOperator<Scheme::RTF>& operator_;
+        
+
         Galoiskey<Scheme::RTF>& galois_key_;
         Relinkey<Scheme::RTF> relin_key_;
         scheme_type scheme_;
@@ -258,6 +470,18 @@ namespace heongpu
         std::vector<uint64_t> psi_pow_;
         const uint64_t generator_ = 3;
         bool is_S2C_initialized_ = false;
+
+        //FV moddown
+        std::shared_ptr<DeviceVector<Data64>> qhalf_;
+        std::shared_ptr<DeviceVector<Data64>> invq_;
+        
+
+        //FV
+        Data64 Delta_FV_;
+        const double message_ratio_ = 64;
+        double messageScaling_;
+
+
     }; 
 } // namespace heongpu
 

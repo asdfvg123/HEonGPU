@@ -754,10 +754,9 @@ namespace heongpu
         const int H  = N >> 1;
         const int g2 = static_cast<int>(ceil(sqrt(static_cast<double>(H))));
 
-        // inputs[0] = original, inputs[1] = rotate_columns(original)
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
-        rotate_columns(input, ct_swapped, galois_key, local_opt); // pure half-swap only
+        rotate_columns(input, ct_swapped, galois_key, local_opt);
 
         std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> inputs;
         inputs.reserve(2);
@@ -770,26 +769,22 @@ namespace heongpu
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
-            // 1) Baby steps (POSITIVE = LEFT): rotate by +j
             std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
             baby_steps[0] = current_input_ct;
             for (int j = 1; j < g2; ++j) {
-                // baby_steps[j] = current_input_ct;
                 rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
             }
 
-            // 2) Giant step buckets (for THIS group only)
+            // 2) Giant step buckets
             std::map<int, heongpu::Ciphertext<heongpu::Scheme::RTF>> giant_steps_sum;
 
-            // Clean split: use only the blob/shifts of current group
             const auto& blob           = matrix_groups_caller[group_idx][0];
             const auto& current_shifts = shifts_caller[group_idx];
             const Data64* base_ptr     = reinterpret_cast<const Data64*>(blob.data());
 
             for (size_t k = 0; k < current_shifts.size(); ++k) {
-                const int s = current_shifts[k];      // s is already group-local
+                const int s = current_shifts[k];
 
-                // r in [0..H-1], j in [0..g2-1], i = floor(r/g2)
                 const int r = (s < H) ? s : (s - H);
                 const int j = r % g2;
                 const int i = (r - j) / g2;
@@ -801,7 +796,7 @@ namespace heongpu
                     heongpu::DeviceVector<Data64> tmp(N, stream);
                     HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                         tmp.data(),
-                        base_ptr + k * static_cast<size_t>(N), // Use k, not r
+                        base_ptr + k * static_cast<size_t>(N), 
                         static_cast<size_t>(N) * sizeof(Data64),
                         cudaMemcpyDeviceToDevice, stream));
                     pt_diag.memory_set(std::move(tmp));
@@ -854,50 +849,6 @@ namespace heongpu
         }
 
         return final_result;
-    }
-
-
-
-    __host__ void HEOperator<Scheme::RTF>::conjugate(
-        Ciphertext<Scheme::RTF>& input1,
-        Ciphertext<Scheme::RTF>& output,
-        Galoiskey<Scheme::RTF>& galois_key,
-        const ExecutionOptions& options)
-    {
-        // 0) Basic sanity (mirror the other ops’ checks)
-        if (input1.relinearization_required_) {
-            throw std::invalid_argument("conjugate: ciphertext has non-linear part; relinearize first");
-        }
-        if (input1.memory_size() < (2 * n * Q_size_)) {
-            throw std::invalid_argument("conjugate: invalid ciphertext size");
-        }
-        // 1) MUST be in coefficient domain (apply_galois requires it)
-        if (input1.in_ntt_domain_) {
-            throw std::invalid_argument("conjugate: ciphertext must be in coefficient (INTT) domain");
-        }
-
-        // 2) σ_{-1} element
-        const int galois_elt = (2 * n) - 1;
-
-        // 3) Optional but highly recommended: verify the key exists
-        // (If your Galoiskey doesn’t expose this, add a helper. Otherwise skip and rely on apply_galois to throw.)
-        // if (!galois_key.contains(galois_elt)) {
-        //     throw std::invalid_argument("conjugate: missing Galois key for m = 2n-1 (σ_{-1})");
-        // }
-
-        // 4) Do it
-        apply_galois(input1, output, galois_key, galois_elt, options);
-
-        // 5) Force earlier surfacing of GPU errors during debugging
-        if (options.stream_ != cudaStreamDefault) cudaStreamSynchronize(options.stream_);
-    }
-
-    __host__ void HEOperator<Scheme::RTF>::conjugate_inplace(
-        Ciphertext<Scheme::RTF>& input1,
-        Galoiskey<Scheme::RTF>& galois_key,
-        const ExecutionOptions& options)
-    {
-        conjugate(input1, input1, galois_key, options);
     }
 
     __host__ void HEOperator<Scheme::RTF>::relinearize_seal_method_inplace(

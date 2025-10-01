@@ -9,6 +9,7 @@
 #include "ckks/context.cuh"
 #include "ntt.cuh"
 #include "keygeneration.cuh"
+#include "rtf/secretkey.cuh"
 
 namespace heongpu
 {
@@ -79,6 +80,33 @@ namespace heongpu
                            HEContext<Scheme::CKKS>& context,
                            cudaStream_t stream = cudaStreamDefault);
 
+        __host__ Secretkey(const Secretkey<Scheme::RTF>& rtf_key)
+            : scheme_(heongpu::scheme_type::ckks),
+              ring_size_(rtf_key.ring_size_),
+              coeff_modulus_count_(rtf_key.coeff_modulus_count_),
+              n_power_(rtf_key.n_power_),
+              hamming_weight_(rtf_key.hamming_weight_),
+              in_ntt_domain_(rtf_key.in_ntt_domain_),
+              secret_key_generated_(rtf_key.secret_key_generated_),
+              storage_type_(rtf_key.storage_type_)
+        {
+            if (rtf_key.storage_type_ == storage_type::DEVICE)
+            {
+                device_locations_.resize(rtf_key.device_locations_.size(),
+                                         rtf_key.device_locations_.stream());
+                cudaMemcpyAsync(device_locations_.data(),
+                                rtf_key.device_locations_.data(),
+                                rtf_key.device_locations_.size() * sizeof(Data64),
+                                cudaMemcpyDeviceToDevice,
+                                rtf_key.device_locations_.stream());
+            }
+            else if (rtf_key.storage_type_ == storage_type::HOST)
+            {
+                host_locations_.resize(rtf_key.host_locations_.size());
+                std::memcpy(host_locations_.data(), rtf_key.host_locations_.data(),
+                            rtf_key.host_locations_.size() * sizeof(Data64));
+            }
+        }
         /**
          * @brief Returns a pointer to the underlying secret key data.
          *

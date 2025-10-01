@@ -1651,6 +1651,12 @@ namespace heongpu
             Relinkey<Scheme::CKKS>& relin_key,
             const ExecutionOptions& options = ExecutionOptions());
 
+        __host__ Ciphertext<Scheme::CKKS> regular_halfbootstrapping(
+            Ciphertext<Scheme::CKKS>& input1,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            const ExecutionOptions& options = ExecutionOptions());
+
         /**
          * @brief Performs slim bootstrapping on a ciphertext.(For more detail
          * please check README.md)

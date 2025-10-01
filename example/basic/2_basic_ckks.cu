@@ -84,11 +84,11 @@ int main(int argc, char* argv[])
     const int slot_count = poly_modulus_degree / 2;
     std::cout << "Plaintext vector size: " << slot_count << std::endl;
     std::vector<double> message(slot_count, 3);
-    message[0] = 10;
-    message[1] = 20;
-    message[2] = 30;
-    message[3] = 40;
-    message[4] = 0.5;
+    message[0] = 0;
+    message[1] = 0;
+    message[2] = 0;
+    message[3] = 0;
+    message[4] = 0;
 
     // Alternative: HostVector use use pinned memory and memory pool, provide
     // faster data transfer between CPU and GPU.(and vice versa)

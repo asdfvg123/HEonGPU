@@ -10,7 +10,7 @@
 
 typedef unsigned long long Data64;
 constexpr auto Scheme = heongpu::Scheme::RTF;
-
+constexpr auto SchemeCKKS = heongpu::Scheme::CKKS;
 
 static void print_first(const char* tag, const std::vector<uint64_t>& v, size_t k) {
     std::cout << tag << " [0:" << k << "): ";
@@ -27,13 +27,18 @@ int main(int argc, char* argv[])
         heongpu::sec_level_type::none
     );
 
-    size_t poly_modulus_degree = 8192;
+    size_t poly_modulus_degree = 16384;
     context.set_poly_modulus_degree(poly_modulus_degree);
 
+    heongpu::HEContext<SchemeCKKS> contextckks(
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
+    contextckks.set_poly_modulus_degree(poly_modulus_degree);
+    contextckks.set_coeff_modulus_bit_sizes({60, 30, 30, 30}, {60});
+    contextckks.generate();
+
     // context.set_coeff_modulus_default_values(1);
-    std::vector<int> logQ = {58, 58, 58, 58, 59, 59, 59, 59, 59, 59, 59, 59, 59, 59,
-        59, 59};
-    std::vector<int> logP = {59, 59};
+    std::vector<int> logQ = {58, 58, 58, 58, 59};
+    std::vector<int> logP = {59};
     context.set_coeff_modulus_bit_sizes(logQ, logP);
 
     // int plain_modulus = 786433;               
@@ -96,7 +101,7 @@ int main(int argc, char* argv[])
     heongpu::HEEncryptor<Scheme>  encryptor(context, public_key);
     heongpu::HEDecryptor<Scheme>  decryptor(context, secret_key);
     heongpu::HEArithmeticOperator<Scheme> op(context, encoder);
-    heongpu::HEHERA<Scheme> hera(context, encoder, encryptor, op, galois_key, relin_key);
+    heongpu::HEHERA<Scheme> hera(context, contextckks, encoder, encryptor, op, galois_key, relin_key);
 
 
     auto psi = hera.get_psi();
@@ -183,8 +188,8 @@ int main(int argc, char* argv[])
     encoder.decode(vec_result_bsgs, pt_out);
 
     std::vector<uint64_t> coeffs(N);
-
     pt_out.store_in_device(stream);
+
     auto* dptr = pt_out.data();
     cudaMemcpyAsync(
         coeffs.data(), dptr, pt_out.size() * sizeof(uint64_t),

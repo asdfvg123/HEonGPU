@@ -296,6 +296,7 @@ namespace heongpu
         std::shared_ptr<DeviceVector<int>> I_j_;
         std::shared_ptr<DeviceVector<int>> I_location_;
         std::shared_ptr<DeviceVector<int>> Sk_pair_;
+
     };
 
 } // namespace heongpu

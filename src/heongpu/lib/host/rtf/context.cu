@@ -385,6 +385,7 @@ namespace heongpu
         }
     }
 
+
     void HEContext<Scheme::RTF>::generate()
     {
         if ((!context_generated_) && (poly_modulus_degree_specified_) &&
@@ -823,7 +824,6 @@ namespace heongpu
                     throw std::invalid_argument("Invalid Key Switching Type");
                     break;
             }
-
             context_generated_ = true;
         }
         else
