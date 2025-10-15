@@ -55,15 +55,15 @@ int main(int argc, char* argv[])
     context.set_poly_modulus_degree(poly_modulus_degree);
 
     std::vector<int> logQ = {
-        60, 44, 44, 44, 44, 
-        44, 44, 44, 44, 44,
-        44, 44, 44, 44, 44,
-        44, 44, 44, 44, 44,
-        44, 44, 44, 44, 44,
-        44, 44, 44, 44, 44};
+        60, 50, 50, 50, 50, 
+        50, 50, 50, 50, 50,
+        50, 50, 50, 50, 50,
+        50, 50, 50, 50, 50,
+        50, 50, 50, 50, 50,
+        50, 50, 50, 50, 50, 50, 50};
     std::vector<int> logP = {60, 60, 60};
     context.set_coeff_modulus_bit_sizes(logQ, logP);
-    double scale = std::pow(2.0, 44);
+    double scale = std::pow(2.0, 50);
     double delta = static_cast<double>(64);
     int plain_modulus = 65537;
     context.set_plain_modulus(plain_modulus);
@@ -133,7 +133,7 @@ int main(int argc, char* argv[])
     // BFV Operations
     // =========================================================================
     std::vector<uint64_t> message(N, 0ULL);
-    for (int i = 0; i < N; ++i) message[i] = static_cast<uint64_t>(((i+1) % 16)*delta);
+    for (int i = 0; i < N; ++i) message[i] = delta * (i % 16);
     print_first("(message)", message, 32);
 
     heongpu::Plaintext<Scheme> pt_in(context);
@@ -148,7 +148,7 @@ int main(int argc, char* argv[])
 
 
     std::vector<uint64_t> message_client(N, 0ULL);
-    for (int i = 0; i < N; ++i) message_client[i] = static_cast<uint64_t>((((i+1) % 16)+ 1)*delta);
+    for (int i = 0; i < N; ++i) message_client[i] = delta * ((i % 16) + (i % 4));
     print_first("(message_client)", message_client, 32);
     auto pt_ske = hera.vec2poly(message_client);
 
@@ -192,12 +192,11 @@ int main(int argc, char* argv[])
     keygenckks.generate_galois_key(galois_keyckks, secret_key_ckks);
     
     
-    heongpu::Ciphertext<heongpu::Scheme::CKKS> cipher_boot =
+    auto [cipher_boot0, cipher_boot1] =
         operatorsckks.regular_halfbootstrapping(ct_ckks, galois_keyckks, relin_keyckks); // slot [0, 0, 0]
-    std::cout << "cipher_boot scale : " << cipher_boot.scale() << std::endl;
 
     heongpu::Plaintext<SchemeCKKS> pt_ckks_out(contextckks);
-    decryptor_ckks.decrypt(pt_ckks_out, cipher_boot); // coeff should have something.
+    decryptor_ckks.decrypt(pt_ckks_out, cipher_boot0); // coeff should have something.
 
     // std::vector<double> decrypted_result(pt_ckks_out.size());
     // get_coeffs(decrypted_result, pt_ckks_out);
@@ -208,7 +207,7 @@ int main(int argc, char* argv[])
     encoder_ckks.decode(decrypted_result, pt_ckks_out); 
 
     std::cout << "\nFinal result after transciphering and decryption:" << std::endl;
-    display_vector(decrypted_result);
+    display_vector(decrypted_result, 4096, 3);
 
     return EXIT_SUCCESS;
 }

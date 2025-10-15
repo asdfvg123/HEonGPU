@@ -3954,7 +3954,7 @@ namespace heongpu
     }
 
     
-    __host__ Ciphertext<Scheme::CKKS>
+    __host__ std::pair<Ciphertext<Scheme::CKKS>, Ciphertext<Scheme::CKKS>>
     HEArithmeticOperator<Scheme::CKKS>::regular_halfbootstrapping(
         Ciphertext<Scheme::CKKS>& input1, Galoiskey<Scheme::CKKS>& galois_key,
         Relinkey<Scheme::CKKS>& relin_key, const ExecutionOptions& options)
@@ -4087,7 +4087,9 @@ namespace heongpu
         rescale_inplace(ciph_sin1, options_inner);
     
         ciph_sin0.scale_ = scale_boot_;
-        return ciph_sin0;
+
+
+        return { std::move(ciph_sin0), std::move(ciph_sin1) };
 
         // Slot to coeff
         // Ciphertext<Scheme::CKKS> StoC_results =

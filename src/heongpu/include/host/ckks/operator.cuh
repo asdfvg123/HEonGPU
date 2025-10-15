@@ -19,6 +19,7 @@
 #include "ckks/plaintext.cuh"
 #include "ckks/ciphertext.cuh"
 #include "ckks/evaluationkey.cuh"
+#include <utility>
 
 namespace heongpu
 {
@@ -1261,7 +1262,7 @@ namespace heongpu
         std::shared_ptr<std::vector<DeviceVector<Data64>>> prod_D_to_B_leveled_;
         std::shared_ptr<std::vector<DeviceVector<Data64>>> prod_B_to_D_leveled_;
 
-        // Method2
+        // Method2return { std::move(ciph_sin0), std::move(ciph_sin1) };
         std::shared_ptr<std::vector<DeviceVector<Data64>>>
             base_change_matrix_D_to_Qtilda_leveled_;
         std::shared_ptr<std::vector<DeviceVector<Data64>>>
@@ -1651,7 +1652,8 @@ namespace heongpu
             Relinkey<Scheme::CKKS>& relin_key,
             const ExecutionOptions& options = ExecutionOptions());
 
-        __host__ Ciphertext<Scheme::CKKS> regular_halfbootstrapping(
+        __host__ std::pair<Ciphertext<Scheme::CKKS>, Ciphertext<Scheme::CKKS>>
+        regular_halfbootstrapping(
             Ciphertext<Scheme::CKKS>& input1,
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key,

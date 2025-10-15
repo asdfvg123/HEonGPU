@@ -657,8 +657,6 @@ namespace heongpu
     {
         cudaStream_t stream = options.stream_;
         moddown_FV_inplace(ct_bfv, options);
-        std::cout << "here1" << std::endl;
-
 
         if (contextbfv_.get_poly_modulus_degree() != contextckks_.get_poly_modulus_degree()) {
             throw std::invalid_argument("Poly modulus degree mismatch between BFV and CKKS contexts.");
