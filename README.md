@@ -1,3 +1,25 @@
+# GPU Accelerated RtF Library
+
+This project accelerates RtF using GPU accelerated FHE library, HEonGPU. We implement the server-side of the framework, including (homomorphic) stream key generation, (homomorphic) decryption, and transciphering. In particular, we implement HERA/Rubato HHE scheme for the server to generate the stream key used for encrypting the data from the client, we implement homomorphic decryption and transciphering from an FV ciphertext to CKKS ciphertext for approximate computation.
+
+For more information about RtF:
+- https://eprint.iacr.org/2020/1335.pdf
+
+<div align="center">
+
+### Execution times of the RtF flow
+
+| HHE Scheme             | logN | logl | r | logQP | logDelta_CKKS | Offline Latency | Online Latency  | Throughput  |
+|:----------------------:|:----:|:----:|:-:|:-----:|:-------------:|:---------------:|:---------------:|:-----------:|
+| **HERA Par-128**       | 16   | 16   | 5 | 1533  | 50            |                 |                 |             |
+| **Rubato Par-128S**    | 16   | 12   | 5 | 1533  | 50            |                 |                 |             |
+| **Rubato Par-128L**    | 16   | 60   | 2 | 1533  | 50            |                 |                 |             |
+
+</div>
+All experiments are conducted with A100. 
+
+
+
 # 🚀 **HEonGPU** - A GPU Based Homomorphic Encryption Library
 
 HEonGPU is a high-performance library designed to optimize Fully Homomorphic Encryption (FHE) operations on GPUs. By leveraging the parallel processing power of GPUs, it significantly reduces the computational load of FHE through concurrent execution of complex operations. Its multi-stream architecture enables efficient parallel processing and minimizes the overhead of data transfers between the CPU and GPU. These features make HEonGPU ideal for large-scale encrypted computations, offering reduced latency and improved performance.
