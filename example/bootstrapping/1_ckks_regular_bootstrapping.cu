@@ -58,7 +58,7 @@ int main(int argc, char* argv[])
     std::vector<Complex64> message;
     for (int i = 0; i < slot_count; i++)
     {
-        message.push_back(Complex64(10.0, 0.4));
+        message.push_back(Complex64(0.2, 0.4));
     }
 
     //  Transfer that vector from CPU to GPU and Encode that simple vector in

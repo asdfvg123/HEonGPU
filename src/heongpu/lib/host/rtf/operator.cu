@@ -771,8 +771,11 @@ namespace heongpu
 
             std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
             baby_steps[0] = current_input_ct;
+            // for (int j = 1; j < g2; ++j) {
+            //     rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
+            // }
             for (int j = 1; j < g2; ++j) {
-                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
+                rotate_rows(baby_steps[j-1], baby_steps[j], galois_key, 1, local_opt);
             }
 
             // 2) Giant step buckets
@@ -788,7 +791,7 @@ namespace heongpu
                 const int r = (s < H) ? s : (s - H);
                 const int j = r % g2;
                 const int i = (r - j) / g2;
-
+                // std::cout << "i = " << i << ", j = " << j << ", s = " << s << std::endl;
                 heongpu::Ciphertext<heongpu::Scheme::RTF> term = baby_steps[j];
 
                 heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;

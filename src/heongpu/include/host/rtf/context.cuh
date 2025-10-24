@@ -52,6 +52,13 @@ namespace heongpu
             const std::vector<int>& log_Q_bases_bit_sizes,
             const std::vector<int>& log_P_bases_bit_sizes);
 
+        
+        std::pair<std::vector<int>, std::vector<int>>
+        get_coeff_modulus_bit_sizes(){
+            return std::make_pair(Q_mod_bit_sizes_, P_mod_bit_sizes_);
+        }
+        
+
         void set_coeff_modulus_values(const std::vector<Data64>& log_Q_bases,
                                       const std::vector<Data64>& log_P_bases);
 

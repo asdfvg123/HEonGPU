@@ -22,7 +22,7 @@ int main(int argc, char* argv[])
 
 
 
-    size_t poly_modulus_degree = 32768; // divisible by 16
+    size_t poly_modulus_degree = 65536; // divisible by 16
     context.set_poly_modulus_degree(poly_modulus_degree);
 
     context.set_coeff_modulus_default_values(1);
