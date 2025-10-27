@@ -521,8 +521,10 @@ namespace heongpu
         s2c_matrix_shifts_[1].resize(N - H);
         std::iota(s2c_matrix_shifts_[1].begin(), s2c_matrix_shifts_[1].end(), H);
 
-        heongpu::DeviceVector<Data64> blob0((size_t)N * H, stream);
-        heongpu::DeviceVector<Data64> blob1((size_t)N * (N - H), stream);
+        const size_t per_diag_len = (size_t)N * (size_t)Q_size_;
+        heongpu::DeviceVector<Data64> blob0(per_diag_len * (size_t)H, stream);
+        heongpu::DeviceVector<Data64> blob1(per_diag_len * (size_t)(N - H), stream);
+
 
         heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(contextbfv_);
         std::vector<uint64_t> diag_slots(N);
@@ -559,20 +561,23 @@ namespace heongpu
             pre_rotate_diagonals(diag_slots, H, giant);
 
             encoder_.encode(pt_diag, diag_slots, options);
-            
+
+            // 2) NTT(RNS) 로 변환 → 내부 버퍼가 N * Q_size_ 로 바뀜
+            operator_.transform_to_ntt_inplace(pt_diag, options);
+
+            // 3) ⬇⬇⬇ 변경: N이 아니라 N * Q_size_ 바이트를 복사
+            const Data64* src = pt_diag.data();
             if (s < H) {
-                const size_t k = (size_t)s; 
+                const size_t k = (size_t)s;
+                Data64* dst = blob0.data() + k * per_diag_len;
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                    blob0.data() + k * (size_t)N,
-                    pt_diag.data(),
-                    (size_t)N * sizeof(Data64),
+                    dst, src, per_diag_len * sizeof(Data64),
                     cudaMemcpyDeviceToDevice, stream));
             } else {
-                const size_t k = (size_t)(s - H); 
+                const size_t k = (size_t)(s - H);
+                Data64* dst = blob1.data() + k * per_diag_len;
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                    blob1.data() + k * (size_t)N,
-                    pt_diag.data(),
-                    (size_t)N * sizeof(Data64),
+                    dst, src, per_diag_len * sizeof(Data64),
                     cudaMemcpyDeviceToDevice, stream));
             }
         }

@@ -755,6 +755,7 @@ namespace heongpu
         const int N  = static_cast<int>(n);
         const int H  = N >> 1;
         const int g2 = static_cast<int>(ceil(sqrt(static_cast<double>(H))));
+        const size_t per_diag_len = (size_t)N * (size_t)Q_size_; // ⬅ 추가
 
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
@@ -802,28 +803,29 @@ namespace heongpu
                 // std::cout << "i = " << i << ", j = " << j << ", s = " << s << std::endl;
                 heongpu::Ciphertext<heongpu::Scheme::RTF> term = baby_steps[j];
 
+                heongpu::DeviceVector<Data64> tmp(per_diag_len, stream);
+                const Data64* src = base_ptr + k * per_diag_len;
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    tmp.data(), src, per_diag_len * sizeof(Data64),
+                    cudaMemcpyDeviceToDevice, stream));
+
                 heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
-                {
-                    nvtxRangeId_t rangeA = nvtxRangeStartA("pt_diag");
-                    heongpu::DeviceVector<Data64> tmp(N, stream);
-                    HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                        tmp.data(),
-                        base_ptr + k * static_cast<size_t>(N), 
-                        static_cast<size_t>(N) * sizeof(Data64),
-                        cudaMemcpyDeviceToDevice, stream));
-                    nvtxRangeEnd(rangeA);
-                    pt_diag.memory_set(std::move(tmp));
-                    pt_diag.scheme_     = scheme_;
-                    pt_diag.plain_size_ = static_cast<int>(N);
-                }
+                // HEOperator 는 Plaintext의 friend 니까 내부 플래그 직접 세팅 가능
+                pt_diag.memory_set(std::move(tmp));
+                pt_diag.scheme_         = scheme_;
+                pt_diag.plain_size_     = N;          // 논리적 slot 수는 N
+                pt_diag.in_ntt_domain_  = true;       // ⬅ 반드시 TRUE
+                pt_diag.storage_type_   = storage_type::DEVICE;
+                pt_diag.plaintext_generated_ = true;
                 
                 // nvtxRangeId_t rangeC = nvtxRangeStartA("NTT term");
                 // transform_to_ntt_inplace(term,    local_opt);
                 // nvtxRangeEnd(rangeC);
 
-                nvtxRangeId_t rangeD = nvtxRangeStartA("NTT pt_diag");
-                transform_to_ntt_inplace(pt_diag, local_opt);
-                nvtxRangeEnd(rangeD);
+                // nvtxRangeId_t rangeD = nvtxRangeStartA("NTT pt_diag");
+                // transform_to_ntt_inplace(pt_diag, local_opt);
+                // nvtxRangeEnd(rangeD);
+
                 multiply_plain_inplace(term, pt_diag, local_opt);
 
                 // nvtxRangeId_t rangeE = nvtxRangeStartA("NTT result");
