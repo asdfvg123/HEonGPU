@@ -478,7 +478,7 @@ namespace heongpu
 
         //FV
         Data64 Delta_FV_;
-        const double message_ratio_ = 64;
+        const double message_ratio_ = 1<<15;
         double messageScaling_;
 
 

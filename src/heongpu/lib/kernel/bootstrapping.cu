@@ -322,10 +322,26 @@ namespace heongpu
         output[idx] = rotated;
     }
 
-    // TODO: implement it for multiple RNS prime (currently it only works for
-    // single prime)
+    // // TODO: implement it for multiple RNS prime (currently it only works for
+    // // single prime)
+    // __global__ void mod_raise_kernel(Data64* input, Data64* output,
+    //                                  Modulus64* modulus, int n_power)
+    // {
+    //     int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+    //     int idy = blockIdx.y; // rns count
+    //     int idz = blockIdx.z; // cipher count
+
+    //     int location_input = idx + (idz << n_power);
+    //     int location_output =
+    //         idx + (idy << n_power) + ((gridDim.y * idz) << n_power);
+
+    //     Data64 input_r = input[location_input];
+    //     Data64 result = OPERATOR_GPU_64::reduce_forced(input_r, modulus[idy]);
+
+    //     output[location_output] = result;
+    // }
     __global__ void mod_raise_kernel(Data64* input, Data64* output,
-                                     Modulus64* modulus, int n_power)
+                                    Modulus64* modulus, int n_power)
     {
         int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
         int idy = blockIdx.y; // rns count
@@ -335,12 +351,31 @@ namespace heongpu
         int location_output =
             idx + (idy << n_power) + ((gridDim.y * idz) << n_power);
 
+        Modulus64 q0_mod = modulus[0]; 
+        Data64 q0_val = q0_mod.value;
+        Data64 q0_half_val = q0_val >> 1;
+
         Data64 input_r = input[location_input];
-        Data64 result = OPERATOR_GPU_64::reduce_forced(input_r, modulus[idy]);
+        
+        int64_t centered_coeff = static_cast<int64_t>(input_r);
 
-        output[location_output] = result;
+        if (input_r > q0_half_val) 
+        {
+            centered_coeff -= static_cast<int64_t>(q0_val);
+        }
+
+        Modulus64 qj_mod = modulus[idy];
+        Data64 qj_val = qj_mod.value;
+
+        int64_t reduced_val = centered_coeff % static_cast<int64_t>(qj_val);
+
+        if (reduced_val < 0)
+        {
+            reduced_val += static_cast<int64_t>(qj_val);
+        }
+
+        output[location_output] = static_cast<Data64>(reduced_val);
     }
-
     __global__ void
     tfhe_nand_pre_comp_kernel(int32_t* output_a, int32_t* output_b,
                               int32_t* input1_a, int32_t* input1_b,

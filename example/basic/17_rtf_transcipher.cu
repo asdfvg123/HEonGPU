@@ -67,9 +67,9 @@ int main(int argc, char* argv[])
     std::vector<int> logP = {60}; 
     context.set_coeff_modulus_bit_sizes(logQ, logP);
     double scale = std::pow(2.0, 50);
-    double delta = static_cast<double>(64);
-    int plain_modulus = 65537;
-    // int plain_modulus = 0x1fc0001ULL;
+    double delta = static_cast<double>(std::pow(2.0, 15)); // for BFV encoding
+    // int plain_modulus = 65537;
+    int plain_modulus = 0x1fc0001ULL; // 28
     context.set_plain_modulus(plain_modulus);
 
     context.generate();
@@ -108,7 +108,9 @@ int main(int argc, char* argv[])
     const int H = static_cast<int>(N/2);
 
     std::set<int> required_shifts;
-    required_shifts.insert(1);
+    
+    for(int v=1; v<g2; ++v) required_shifts.insert(v);
+    
     required_shifts.insert(-1);
     for (int s = 0; s < N; ++s) {
         int r = (s < H) ? s : (s - H);
@@ -220,7 +222,7 @@ int main(int argc, char* argv[])
     encoder_ckks.decode(decrypted_result, pt_ckks_out); 
 
     std::cout << "\nFinal result after transciphering and decryption:" << std::endl;
-    display_vector(decrypted_result, 64, 3);
+    display_vector(decrypted_result, 4096, 3);
 
     return EXIT_SUCCESS;
 }

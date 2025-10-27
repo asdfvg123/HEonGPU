@@ -12,22 +12,22 @@ int main(int argc, char* argv[])
 
     // Initialize encryption parameters for the CKKS scheme.
     heongpu::HEContext<heongpu::Scheme::CKKS> context(
-        heongpu::keyswitching_type::KEYSWITCHING_METHOD_II,
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I,
         heongpu::sec_level_type::none);
-    size_t poly_modulus_degree = 4096;
+    size_t poly_modulus_degree = 16384;
     context.set_poly_modulus_degree(poly_modulus_degree);
 
     context.set_coeff_modulus_bit_sizes(
         {60, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50,
          50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50},
-        {60, 60, 60});
+        {60});
     context.generate();
     context.print_parameters();
 
     // The scale is set to 2^50, resulting in 50 bits of precision before the
     // decimal point.
     double scale = pow(2.0, 50);
-
+ 
     // Generate keys: the public key for encryption, the secret key for
     // decryption and evaluation key(relinkey) for relinearization.
     heongpu::HEKeyGenerator<heongpu::Scheme::CKKS> keygen(context);
@@ -58,7 +58,7 @@ int main(int argc, char* argv[])
     std::vector<Complex64> message;
     for (int i = 0; i < slot_count; i++)
     {
-        message.push_back(Complex64(0.2, 0.4));
+        message.push_back(Complex64(4.0, 0.4));
     }
 
     //  Transfer that vector from CPU to GPU and Encode that simple vector in
@@ -111,13 +111,7 @@ int main(int argc, char* argv[])
     std::vector<Complex64> decrypted_1;
     encoder.decode(decrypted_1, P_res1);
 
-    // for(int j = 0; j < slot_count; j++){
-    for (int j = 0; j < 16; j++)
-    {
-        std::cout << j << "-> EXPECTED:" << message[j]
-                  << " - ACTUAL:" << decrypted_1[j] << std::endl;
-    }
-    std::cout << std::endl;
+    display_vector(decrypted_1, 16, 3);
 
     return EXIT_SUCCESS;
 }
