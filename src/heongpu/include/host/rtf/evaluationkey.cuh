@@ -400,6 +400,11 @@ namespace heongpu
             return (storage_type_ == storage_type::DEVICE);
         }
 
+        size_t get_memory_size_in_bytes() const
+        {
+            return static_cast<size_t>(galoiskey_size_) * sizeof(Data64);
+        }
+
         /**
          * @brief Returns a pointer to the specified part of the Galois key
          * data.

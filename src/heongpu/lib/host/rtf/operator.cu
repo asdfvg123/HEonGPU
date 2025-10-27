@@ -737,6 +737,8 @@ namespace heongpu
         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
         const ExecutionOptions& opt)
     {
+        nvtx3::scoped_range data_processing_range("bsgs");
+
         cudaStream_t stream = opt.stream_;
         if (stream == cudaStreamDefault)
             stream = input.stream();
@@ -773,7 +775,11 @@ namespace heongpu
             baby_steps[0] = current_input_ct;
             for (int j = 1; j < g2; ++j) {
                 rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
+                transform_to_ntt_inplace(baby_steps[j], local_opt);
             }
+            transform_to_ntt_inplace(baby_steps[0], local_opt);
+
+
             // for (int j = 1; j < g2; ++j) {
             //     rotate_rows(baby_steps[j-1], baby_steps[j], galois_key, 1, local_opt);
             // }
@@ -786,6 +792,8 @@ namespace heongpu
             const Data64* base_ptr     = reinterpret_cast<const Data64*>(blob.data());
 
             for (size_t k = 0; k < current_shifts.size(); ++k) {
+                nvtxRangeId_t rangeB = nvtxRangeStartA("gs");
+
                 const int s = current_shifts[k];
 
                 const int r = (s < H) ? s : (s - H);
@@ -796,27 +804,40 @@ namespace heongpu
 
                 heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
                 {
+                    nvtxRangeId_t rangeA = nvtxRangeStartA("pt_diag");
                     heongpu::DeviceVector<Data64> tmp(N, stream);
                     HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                         tmp.data(),
                         base_ptr + k * static_cast<size_t>(N), 
                         static_cast<size_t>(N) * sizeof(Data64),
                         cudaMemcpyDeviceToDevice, stream));
+                    nvtxRangeEnd(rangeA);
                     pt_diag.memory_set(std::move(tmp));
                     pt_diag.scheme_     = scheme_;
                     pt_diag.plain_size_ = static_cast<int>(N);
                 }
+                
+                // nvtxRangeId_t rangeC = nvtxRangeStartA("NTT term");
+                // transform_to_ntt_inplace(term,    local_opt);
+                // nvtxRangeEnd(rangeC);
 
-                transform_to_ntt_inplace(term,    local_opt);
+                nvtxRangeId_t rangeD = nvtxRangeStartA("NTT pt_diag");
                 transform_to_ntt_inplace(pt_diag, local_opt);
+                nvtxRangeEnd(rangeD);
                 multiply_plain_inplace(term, pt_diag, local_opt);
-                transform_from_ntt_inplace(term, local_opt);
 
+                // nvtxRangeId_t rangeE = nvtxRangeStartA("NTT result");
+                // transform_from_ntt_inplace(term, local_opt);
+                // nvtxRangeEnd(rangeE);
+                
                 auto it = giant_steps_sum.find(i);
                 if (it == giant_steps_sum.end())
                     giant_steps_sum.emplace(i, std::move(term));
                 else
                     add_inplace(it->second, term, local_opt);
+
+                nvtxRangeEnd(rangeB);
+                
             }
 
             // 3) Apply giant rotations (POSITIVE = LEFT): rotate by +(i*g2) and sum
@@ -826,6 +847,8 @@ namespace heongpu
             for (auto& kv : giant_steps_sum) {
                 const int i = kv.first;
                 auto& sum_ct = kv.second;
+
+                transform_from_ntt_inplace(sum_ct, local_opt);
 
                 const int giant_rotation = i * g2;
                 if (giant_rotation != 0) {

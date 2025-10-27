@@ -559,7 +559,7 @@ namespace heongpu
             pre_rotate_diagonals(diag_slots, H, giant);
 
             encoder_.encode(pt_diag, diag_slots, options);
-
+            
             if (s < H) {
                 const size_t k = (size_t)s; 
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
@@ -581,7 +581,7 @@ namespace heongpu
         s2c_matrix_diagonals_[1].clear();
         s2c_matrix_diagonals_[0].push_back(std::move(blob0));
         s2c_matrix_diagonals_[1].push_back(std::move(blob1));
-        
+
         is_S2C_initialized_ = true;
 
         if (stream != cudaStreamDefault)

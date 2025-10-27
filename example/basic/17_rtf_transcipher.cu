@@ -132,6 +132,7 @@ int main(int argc, char* argv[])
     opt.set_storage_type(heongpu::storage_type::DEVICE);
     keygen.generate_galois_key(galois_key, secret_key, opt);
     std::cout << "Galois keys generated." << std::endl;
+    std::cout << "Galois key memory size (bytes): " << galois_key.get_memory_size_in_bytes() << std::endl;
 
     // =========================================================================
     // Setup HE Operators

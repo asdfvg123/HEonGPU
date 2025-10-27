@@ -19,7 +19,7 @@
 #include "rtf/plaintext.cuh"
 #include "rtf/ciphertext.cuh"
 #include "rtf/evaluationkey.cuh"
-
+#include <nvtx3/nvtx3.hpp>
 namespace heongpu
 {
 
