@@ -729,6 +729,27 @@ namespace heongpu
         return acc_ntt;
     }
 
+    __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
+        const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
+        int Q_size_, int n_power, cudaStream_t stream)
+    {
+        const size_t per_ct_len = static_cast<size_t>(Q_size_) << (n_power + 1); // 2 * N * Q
+        const size_t total_len  = per_ct_len * baby_steps.size();
+
+        heongpu::DeviceVector<Data64> packed(total_len, stream);
+
+        for (size_t j = 0; j < baby_steps.size(); ++j) {
+            const Data64* src = baby_steps[j].data(); 
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                packed.data() + j * per_ct_len,
+                src,
+                per_ct_len * sizeof(Data64),
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+        return packed;
+    }
+
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix_bsgs(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
@@ -739,6 +760,7 @@ namespace heongpu
     {
         nvtx3::scoped_range data_processing_range("bsgs");
 
+        // Stream
         cudaStream_t stream = opt.stream_;
         if (stream == cudaStreamDefault)
             stream = input.stream();
@@ -748,6 +770,7 @@ namespace heongpu
                                         .set_storage_type(storage_type::DEVICE)
                                         .set_initial_location(true);
 
+        // Rotations are in coefficient domain
         if (input.in_ntt_domain_) {
             transform_from_ntt_inplace(input, local_opt);
         }
@@ -755,8 +778,11 @@ namespace heongpu
         const int N  = static_cast<int>(n);
         const int H  = N >> 1;
         const int g2 = static_cast<int>(ceil(sqrt(static_cast<double>(H))));
-        const size_t per_diag_len = (size_t)N * (size_t)Q_size_; // ⬅ 추가
+        const int Q  = static_cast<int>(Q_size_);
+        const size_t per_diag_len = static_cast<size_t>(N) * static_cast<size_t>(Q);           // N * Q    (plain diag in NTT/RNS)
+        const size_t per_ct_len   = static_cast<size_t>(Q) << (n_power + 1);                   // 2 * N * Q (cipher)
 
+        // Two groups: original + column-swapped
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
         rotate_columns(input, ct_swapped, galois_key, local_opt);
@@ -772,100 +798,81 @@ namespace heongpu
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
+            // (A) Baby steps (rotate in coeff-domain, then NTT)
             std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
             baby_steps[0] = current_input_ct;
             for (int j = 1; j < g2; ++j) {
-                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
+                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt); // coeff domain
                 transform_to_ntt_inplace(baby_steps[j], local_opt);
             }
             transform_to_ntt_inplace(baby_steps[0], local_opt);
-
-
-            // for (int j = 1; j < g2; ++j) {
-            //     rotate_rows(baby_steps[j-1], baby_steps[j], galois_key, 1, local_opt);
-            // }
-
-            // 2) Giant step buckets
-            std::map<int, heongpu::Ciphertext<heongpu::Scheme::RTF>> giant_steps_sum;
-
-            const auto& blob           = matrix_groups_caller[group_idx][0];
+            auto packed_baby = pack_baby_steps_all(baby_steps, Q_size_, n_power, stream);
+            // (B) Collect diagonals into buckets by giant index i
+            const auto& blob           = matrix_groups_caller[group_idx][0]; // holds all NTT/RNS diagonals
             const auto& current_shifts = shifts_caller[group_idx];
             const Data64* base_ptr     = reinterpret_cast<const Data64*>(blob.data());
 
-            for (size_t k = 0; k < current_shifts.size(); ++k) {
-                nvtxRangeId_t rangeB = nvtxRangeStartA("gs");
+            struct Item { int j; int k; };
+            std::unordered_map<int, std::vector<Item>> buckets; // key = i, value = list of (j,k)
+            buckets.reserve(current_shifts.size());
 
+            for (int k = 0; k < static_cast<int>(current_shifts.size()); ++k) {
                 const int s = current_shifts[k];
-
                 const int r = (s < H) ? s : (s - H);
                 const int j = r % g2;
                 const int i = (r - j) / g2;
-                // std::cout << "i = " << i << ", j = " << j << ", s = " << s << std::endl;
-                heongpu::Ciphertext<heongpu::Scheme::RTF> term = baby_steps[j];
-
-                heongpu::DeviceVector<Data64> tmp(per_diag_len, stream);
-                const Data64* src = base_ptr + k * per_diag_len;
-                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                    tmp.data(), src, per_diag_len * sizeof(Data64),
-                    cudaMemcpyDeviceToDevice, stream));
-
-                heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
-                // HEOperator 는 Plaintext의 friend 니까 내부 플래그 직접 세팅 가능
-                pt_diag.memory_set(std::move(tmp));
-                pt_diag.scheme_         = scheme_;
-                pt_diag.plain_size_     = N;          // 논리적 slot 수는 N
-                pt_diag.in_ntt_domain_  = true;       // ⬅ 반드시 TRUE
-                pt_diag.storage_type_   = storage_type::DEVICE;
-                pt_diag.plaintext_generated_ = true;
-                
-                // nvtxRangeId_t rangeC = nvtxRangeStartA("NTT term");
-                // transform_to_ntt_inplace(term,    local_opt);
-                // nvtxRangeEnd(rangeC);
-
-                // nvtxRangeId_t rangeD = nvtxRangeStartA("NTT pt_diag");
-                // transform_to_ntt_inplace(pt_diag, local_opt);
-                // nvtxRangeEnd(rangeD);
-
-                multiply_plain_inplace(term, pt_diag, local_opt);
-
-                // nvtxRangeId_t rangeE = nvtxRangeStartA("NTT result");
-                // transform_from_ntt_inplace(term, local_opt);
-                // nvtxRangeEnd(rangeE);
-                
-                auto it = giant_steps_sum.find(i);
-                if (it == giant_steps_sum.end())
-                    giant_steps_sum.emplace(i, std::move(term));
-                else
-                    add_inplace(it->second, term, local_opt);
-
-                nvtxRangeEnd(rangeB);
-                
+                buckets[i].push_back({j, k});
             }
 
-            // 3) Apply giant rotations (POSITIVE = LEFT): rotate by +(i*g2) and sum
+            if (buckets.empty()) continue;
+
             heongpu::Ciphertext<heongpu::Scheme::RTF> group_result;
             bool group_result_initialized = false;
 
-            for (auto& kv : giant_steps_sum) {
-                const int i = kv.first;
-                auto& sum_ct = kv.second;
+            // (C) Process each bucket: pack inputs for kernel and MAC in NTT
+            for (auto& kv : buckets) {
+                const int i_giant = kv.first;
+                auto& items = kv.second;
+                const int iters = (int)items.size();
+                if (iters == 0) continue;
 
-                transform_from_ntt_inplace(sum_ct, local_opt);
-
-                const int giant_rotation = i * g2;
-                if (giant_rotation != 0) {
-                    rotate_rows_inplace(sum_ct, galois_key, giant_rotation, local_opt);
+                std::vector<int> h_j_of_iter(iters), h_k_of_iter(iters);
+                for (int t = 0; t < iters; ++t) {
+                    h_j_of_iter[t] = items[t].j;  // 0..g2-1
+                    h_k_of_iter[t] = items[t].k;  // blob 내 diag index
                 }
 
-                if (!group_result_initialized) {
-                    group_result = std::move(sum_ct);
-                    group_result_initialized = true;
-                } else {
-                    add_inplace(group_result, sum_ct, local_opt);
-                }
+                heongpu::DeviceVector<int> d_j_of_iter(iters, stream), d_k_of_iter(iters, stream);
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(d_j_of_iter.data(), h_j_of_iter.data(),
+                    iters*sizeof(int), cudaMemcpyHostToDevice, stream));
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(d_k_of_iter.data(), h_k_of_iter.data(),
+                    iters*sizeof(int), cudaMemcpyHostToDevice, stream));
+
+                heongpu::Ciphertext<heongpu::Scheme::RTF> inner_sum = operator_ciphertext(0);
+                inner_sum.scheme_ = scheme_;
+                inner_sum.ring_size_ = n;
+                inner_sum.coeff_modulus_count_ = Q_size_;
+                inner_sum.cipher_size_ = 2;
+                inner_sum.in_ntt_domain_ = true;
+                inner_sum.ciphertext_generated_ = true;
+
+                dim3 grid((n >> 8), (int)Q_size_, 2), blk(256);
+                cipherplain_multiply_accumulate_idx_kernel<<<grid, blk, 0, stream>>>(
+                    packed_baby.data(),                // 그룹에서 1회 pack
+                    base_ptr,                          // gen_FV_S2C_Matrix() blob
+                    d_j_of_iter.data(), d_k_of_iter.data(),
+                    inner_sum.data(), modulus_->data(),
+                    iters, (int)Q_size_, (int)Q_size_, n_power);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+                transform_from_ntt_inplace(inner_sum, local_opt);
+                const int giant_rotation = i_giant * g2;
+                if (giant_rotation) rotate_rows_inplace(inner_sum, galois_key, giant_rotation, local_opt);
+                if (!group_result_initialized) { group_result = std::move(inner_sum); group_result_initialized = true; }
+                else                           { add_inplace(group_result, inner_sum, local_opt); }
             }
 
-            // 4) Accumulate groups
+            // (F) Accumulate groups
             if (group_result_initialized) {
                 if (!result_initialized) {
                     final_result = std::move(group_result);

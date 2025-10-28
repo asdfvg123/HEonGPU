@@ -360,4 +360,74 @@ namespace heongpu
         out[location_ct] = sum_ctpt;
     }
 
+    __global__ void cipherplain_multiply_accumulate_ctpacked_ptindexed_kernel(
+        const Data64* __restrict__ in1,             // packed baby-steps (per-iter)
+        const Data64* __restrict__ base_diagonals,  // ALL diagonals (blob)
+        const int*    __restrict__ k_of_iter,       // [iteration_count]
+        Data64*             out,                    // NTT domain ciphertext for this bucket
+        const Modulus64*    modulus,
+        int iteration_count,
+        int current_decomp_count,   // = Q_size_
+        int first_decomp_count,     // = Q_size_ (diag stride)
+        int n_power)
+    {
+        const int N    = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x; // coeff
+        const int limb = blockIdx.y;                             // 0..Q-1
+        const int comp = blockIdx.z;                             // 0 or 1
+        if (idx >= N) return;
+
+        // 동일한 메모리 레이아웃 가정([comp][limb][coeff])에 맞춘 stride
+        const int comp_stride = (current_decomp_count << n_power);        // jump comp
+        const int ct_stride   = (current_decomp_count << (n_power + 1));  // next iter (2*N*Q)
+        const int pt_stride   = (first_decomp_count   << n_power);        // next diag (N*Q)
+
+        const int ct_base = idx + (limb << n_power) + (comp * comp_stride);
+        const int pt_base = idx + (limb << n_power);
+
+        Data64 acc = 0ULL;
+        for (int it = 0; it < iteration_count; ++it) {
+            const int kdiag = k_of_iter[it];
+            const Data64 ct = in1[ct_base + it * ct_stride];
+            const Data64 pt = base_diagonals[pt_base + kdiag * pt_stride];
+            const Data64 prod = OPERATOR_GPU_64::mult(ct, pt, modulus[limb]);
+            acc = OPERATOR_GPU_64::add(acc, prod, modulus[limb]);
+        }
+        out[ct_base] = acc;
+    }
+
+    __global__ void cipherplain_multiply_accumulate_idx_kernel(
+        const Data64* __restrict__ packed_baby_steps,  // [g2 * (2*N*Q)], 그룹에서 1회만 pack
+        const Data64* __restrict__ base_diagonals,     // gen_FV_S2C_Matrix()의 blob
+        const int*    __restrict__ j_of_iter,          // [iteration_count], 각 it의 baby-step j
+        const int*    __restrict__ k_of_iter,          // [iteration_count], 각 it의 diag k
+        Data64*             out,                       // NTT 결과
+        const Modulus64*    modulus,
+        int iteration_count, int current_decomp_count, int first_decomp_count, int n_power)
+    {
+        const int N    = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x;
+        const int limb = blockIdx.y;
+        const int comp = blockIdx.z;
+        if (idx >= N) return;
+
+        const int comp_stride = (current_decomp_count << n_power);        // comp jump
+        const int ct_stride   = (current_decomp_count << (n_power + 1));  // per baby-step size
+        const int pt_stride   = (first_decomp_count   << n_power);        // per diag size
+
+        const int ct_base = idx + (limb << n_power) + (comp * comp_stride);
+        const int pt_base = idx + (limb << n_power);
+
+        Data64 acc = 0ULL;
+        for (int it = 0; it < iteration_count; ++it) {
+            const int jslot = j_of_iter[it];
+            const int kdiag = k_of_iter[it];
+            const Data64 ct = packed_baby_steps[ct_base + jslot * ct_stride];
+            const Data64 pt = base_diagonals   [pt_base + kdiag * pt_stride];
+            const Data64 prod = OPERATOR_GPU_64::mult(ct, pt, modulus[limb]);
+            acc = OPERATOR_GPU_64::add(acc, prod, modulus[limb]);
+        }
+        out[ct_base] = acc;
+    }
+
 } // namespace heongpu

@@ -55,5 +55,25 @@ namespace heongpu
         int iteration_count, int current_decomp_count, int first_decomp_count,
         int n_power);
 
+    __global__ void cipherplain_multiply_accumulate_ctpacked_ptindexed_kernel(
+    const Data64* __restrict__ in1,             // packed baby-steps (per-iter)
+    const Data64* __restrict__ base_diagonals,  // ALL diagonals (blob)
+    const int*    __restrict__ k_of_iter,       // [iteration_count]
+    Data64*             out,                    // NTT domain ciphertext for this bucket
+    const Modulus64*    modulus,
+    int iteration_count,
+    int current_decomp_count,   // = Q_size_
+    int first_decomp_count,     // = Q_size_ (diag stride)
+    int n_power);
+
+    __global__ void cipherplain_multiply_accumulate_idx_kernel(
+        const Data64* __restrict__ packed_baby_steps,  // [g2 * (2*N*Q)], 그룹에서 1회만 pack
+        const Data64* __restrict__ base_diagonals,     // gen_FV_S2C_Matrix()의 blob
+        const int*    __restrict__ j_of_iter,          // [iteration_count], 각 it의 baby-step j
+        const int*    __restrict__ k_of_iter,          // [iteration_count], 각 it의 diag k
+        Data64*             out,                       // NTT 결과
+        const Modulus64*    modulus,
+        int iteration_count, int current_decomp_count, int first_decomp_count, int n_power);
+
 } // namespace heongpu
 #endif // HEONGPU_MULTIPLICATION_H

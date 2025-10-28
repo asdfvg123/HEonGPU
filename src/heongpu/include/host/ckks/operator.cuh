@@ -20,6 +20,7 @@
 #include "ckks/ciphertext.cuh"
 #include "ckks/evaluationkey.cuh"
 #include <utility>
+#include <nvtx3/nvtx3.hpp>
 
 namespace heongpu
 {

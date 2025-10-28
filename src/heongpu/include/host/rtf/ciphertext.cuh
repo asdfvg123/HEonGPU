@@ -76,6 +76,13 @@ namespace heongpu
          * @return Data64* Pointer to the data.
          */
         Data64* data();
+        const Data64* data() const noexcept { 
+            if (storage_type_ == storage_type::DEVICE) {
+                return device_locations_.data();
+            } else {
+                return host_locations_.data();
+            }
+        };
 
         /**
          * @brief Copies the data from the device to the host.

@@ -3965,7 +3965,7 @@ namespace heongpu
                 "Bootstrapping operation can not be performed before "
                 "generating Bootstrapping parameters!");
         }
-
+        nvtxRangeId_t rangeB = nvtxRangeStartA("halfboot");
         // Raise modulus
         int current_decomp_count = Q_size_ - input1.depth_;
         if (current_decomp_count != 1)
@@ -4088,7 +4088,7 @@ namespace heongpu
     
         ciph_sin0.scale_ = scale_boot_;
 
-
+        nvtxRangeEnd(rangeB);
         return { std::move(ciph_sin0), std::move(ciph_sin1) };
 
         // Slot to coeff
