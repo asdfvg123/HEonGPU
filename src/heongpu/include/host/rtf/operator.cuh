@@ -1219,7 +1219,55 @@ namespace heongpu
             Galoiskey<Scheme::RTF>& galois_key,
             const ExecutionOptions& options = ExecutionOptions()
         );
-        
+
+
+        struct BFVKeySwitchHoistedMethodI {
+            // Precomputed (per-ciphertext):
+            heongpu::DeviceVector<Data64> temp0_dup;   // (2 * n * Q_size_)
+            heongpu::DeviceVector<Data64> temp1_ntt;   // (n * Q_size_ * Q_prime_size_) after FORWARD NTT
+
+            // Scratch reused across rotations (optional but good for perf):
+            heongpu::DeviceVector<Data64> temp2_acc;   // (2 * n * Q_prime_size_)
+            bool prepared = false;
+
+            void clear() {
+                temp0_dup.clear();
+                temp1_ntt.clear();
+                temp2_acc.clear();
+                prepared = false;
+            }
+        };
+        __host__ void rotate_rows_method_I_hoisted(
+            BFVKeySwitchHoistedMethodI& ws,                    // prepared once
+            Ciphertext<Scheme::RTF>& input1,                   // same ct used in prepare
+            Ciphertext<Scheme::RTF>& output,                   // per-rotation result
+            Galoiskey<Scheme::RTF>& galois_key,
+            int shift,
+            const cudaStream_t stream);
+
+        __host__ void apply_galois_method_I_with_hoisted(
+            BFVKeySwitchHoistedMethodI& ws,
+            Ciphertext<Scheme::RTF>& output,
+            Galoiskey<Scheme::RTF>& galois_key,
+            int galois_elt,
+            const cudaStream_t stream);
+
+        __host__ void prepare_keyswitch_hoisted_method_I(
+            Ciphertext<Scheme::RTF>& input_ct,
+            BFVKeySwitchHoistedMethodI& ws,
+            const cudaStream_t stream);
+
+        __host__ heongpu::DeviceVector<Data64>
+            pack_baby_steps_all_hoisted_ntt(
+                heongpu::HEOperator<heongpu::Scheme::RTF>& op,            // 연산자 (rotate/NTT 호출용)
+                heongpu::Ciphertext<heongpu::Scheme::RTF>  input,         // current_input_ct (by value; 내부에서 변형)
+                int g2,                                                   // baby-step 개수
+                heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+                Modulus64* modulus_array,                                 // ← gpuntt::Modulus<Data64>* (비-const)
+                Root<Data64>* root_table,                         // ← gpuntt::Root<Data64>*
+                int n_power, int Q,                                       // 링/모듈 수
+                cudaStream_t stream);
+
         __host__ heongpu::DeviceVector<Data64> batched_plain_to_ntt_slab(
             const Data64* base_plain,                 // big blob of all plain diagonals
             const std::vector<int>& k_list,           // size B: which diagonals to pick

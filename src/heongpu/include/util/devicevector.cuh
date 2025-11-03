@@ -170,6 +170,12 @@ namespace heongpu
                             out.size() * sizeof(T), cudaMemcpyDeviceToDevice,
                             stream);
         }
+        void clear(cudaStream_t stream = cudaStreamDefault) {
+            Dvec::resize(0, stream);
+        }
+        bool empty() const noexcept { return Dvec::size() == 0; }
+        size_t bytes() const noexcept { return Dvec::size() * sizeof(T); }
+
     };
 
 } // namespace heongpu

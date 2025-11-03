@@ -800,6 +800,313 @@ namespace heongpu
     }
 
 
+    __host__ heongpu::DeviceVector<Data64>
+     heongpu::HEOperator<heongpu::Scheme::RTF>::pack_baby_steps_all_hoisted_ntt(
+        heongpu::HEOperator<heongpu::Scheme::RTF>& op,            // 연산자 (rotate/NTT 호출용)
+        heongpu::Ciphertext<heongpu::Scheme::RTF>  input,         // current_input_ct (by value; 내부에서 변형)
+        int g2,                                                   // baby-step 개수
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        Modulus64* modulus_array,                                 // ← gpuntt::Modulus<Data64>* (비-const)
+        Root<Data64>* root_table,                         // ← gpuntt::Root<Data64>*
+        int n_power, int Q,                                       // 링/모듈 수
+        cudaStream_t stream)
+    {
+        const int    N          = 1 << n_power;
+        const size_t per_ct_len = (size_t)Q << (n_power + 1); // 2 * N * Q
+
+        auto local_opt = heongpu::ExecutionOptions()
+                            .set_stream(stream)
+                            .set_storage_type(heongpu::storage_type::DEVICE)
+                            .set_initial_location(true);
+
+        // 0) 입력을 계수영역으로
+        if (input.in_ntt_domain_) {
+            op.transform_from_ntt_inplace(input, local_opt);
+        }
+
+        // 1) 회전 결과를 계수영역 버퍼에 이어붙이기
+        heongpu::DeviceVector<Data64> baby_coeff_concat(per_ct_len * g2, stream);
+
+        // Prepare once per ciphertext:
+        BFVKeySwitchHoistedMethodI hoisted;
+        op.prepare_keyswitch_hoisted_method_I(input, hoisted, stream);
+
+        nvtxRangeId_t rangeA = nvtxRangeStartA("Copy");
+
+        // j = 0 : 그대로 복사
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            baby_coeff_concat.data() + 0 * per_ct_len,
+            input.data(),
+            per_ct_len * sizeof(Data64),
+            cudaMemcpyDeviceToDevice, stream));
+
+        // j = 1..g2-1 : **hoisted** rotations
+        for (int j = 1; j < g2; ++j) {
+            heongpu::Ciphertext<heongpu::Scheme::RTF> rotated;
+            op.rotate_rows_method_I_hoisted(hoisted, input, rotated, galois_key, j, stream);
+
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                baby_coeff_concat.data() + (size_t)j * per_ct_len,
+                rotated.data(),
+                per_ct_len * sizeof(Data64),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+        nvtxRangeEnd(rangeA);
+
+        // 2) RNS batched NTT: batch_size = g2 * 2 * Q, mod_count = Q (한 번 호출)
+        heongpu::DeviceVector<Data64> baby_ntt_concat(per_ct_len * g2, stream);
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = nullptr,  // forward에선 사용 안 함
+            .stream = stream
+        };
+
+        nvtxRangeId_t rangeB = nvtxRangeStartA("Batched NTT");
+        gpuntt::GPU_NTT(
+            /*device_in=*/baby_coeff_concat.data(),
+            /*device_out=*/baby_ntt_concat.data(),
+            /*root_of_unity_table=*/root_table,      // gpuntt::Root<Data64>*
+            /*modulus=*/modulus_array,               // Modulus64*  (= gpuntt::Modulus<Data64>*)
+            /*cfg=*/cfg_ntt,
+            /*batch_size=*/g2 * 2 * Q,
+            /*mod_count=*/Q);
+        GPUNTT_CUDA_CHECK(cudaGetLastError());
+        nvtxRangeEnd(rangeB);
+
+        // 3) 결과(=NTT 후 baby-steps 이어붙인 것)를 그대로 packed_baby로 리턴
+        return baby_ntt_concat;
+    }
+
+
+    __host__ void HEOperator<Scheme::RTF>::apply_galois_method_I_with_hoisted(
+        BFVKeySwitchHoistedMethodI& ws,
+        Ciphertext<Scheme::RTF>& output,
+        Galoiskey<Scheme::RTF>& galois_key,
+        int galois_elt,
+        const cudaStream_t stream)
+    {
+        if (!ws.prepared) {
+            throw std::logic_error("Hoisted Method I workspace not prepared.");
+        }
+
+        // Local aliases
+        Data64* temp0_rotation = const_cast<Data64*>(ws.temp0_dup.data());   // used read-only here
+        Data64* temp1_rotation = const_cast<Data64*>(ws.temp1_ntt.data());   // used read-only here
+
+        // Per-rotation scratch (accumulators in P)
+        Data64* temp2_rotation = ws.temp2_acc.data();
+
+        // Output buffer (Q-domain, 2 components)
+        heongpu::DeviceVector<Data64> output_memory((size_t)2 * n * Q_size_, stream);
+
+        // === Multiply-accumulate in NTT domain with the *rotation-specific* key ===
+        int iteration_count_1 = Q_size_ / 4;
+        int iteration_count_2 = Q_size_ % 4;
+
+        if (galois_key.storage_type_ == storage_type::DEVICE) {
+            keyswitch_multiply_accumulate_kernel<<<dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
+                temp1_rotation,
+                galois_key.device_location_[galois_elt].data(),
+                temp2_rotation,
+                modulus_->data(),
+                n_power,
+                Q_prime_size_,
+                iteration_count_1,
+                iteration_count_2
+            );
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        } else {
+            heongpu::DeviceVector<Data64> key_location(
+                galois_key.host_location_[galois_elt],
+                stream
+            );
+            keyswitch_multiply_accumulate_kernel<<<dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
+                temp1_rotation,
+                key_location.data(),
+                temp2_rotation,
+                modulus_->data(),
+                n_power,
+                Q_prime_size_,
+                iteration_count_1,
+                iteration_count_2
+            );
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+
+        // === Inverse NTT over P ===
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = n_inverse_->data(),
+            .stream = stream
+        };
+
+        gpuntt::GPU_NTT_Inplace(
+            temp2_rotation,
+            intt_table_->data(),
+            modulus_->data(),
+            cfg_intt,
+            2 * Q_prime_size_,   // two components, each over |P|
+            Q_prime_size_
+        );
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        // === Mod-down + logical permutation (depends on galois_elt) ===
+        divide_round_lastq_permute_bfv_kernel<<<dim3((n >> 8), Q_size_, 2), 256, 0, stream>>>(
+            temp2_rotation,            // from P
+            temp0_rotation,            // dup of original c0 (and/or needed constants)
+            output_memory.data(),      // to Q
+            modulus_->data(),
+            half_p_->data(),
+            half_mod_->data(),
+            last_q_modinv_->data(),
+            galois_elt,
+            n_power,
+            Q_prime_size_,
+            Q_size_,
+            P_size_
+        );
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        // Hand back as a ciphertext object (same as your original)
+        output.memory_set(std::move(output_memory));
+        output.scheme_ = scheme_;
+        output.ring_size_ = n;
+        output.coeff_modulus_count_ = Q_size_;
+        output.cipher_size_ = 2;
+        output.in_ntt_domain_ = false;
+        output.relinearization_required_ = false;
+        output.ciphertext_generated_ = true;
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::prepare_keyswitch_hoisted_method_I(
+        Ciphertext<Scheme::RTF>& input_ct,
+        BFVKeySwitchHoistedMethodI& ws,
+        const cudaStream_t stream)
+    {
+        if (input_ct.in_ntt_domain_ != false) {
+            throw std::invalid_argument("Ciphertext should be in INT domain for Method I.");
+        }
+        if (input_ct.memory_size() < (2 * n * Q_size_)) {
+            throw std::invalid_argument("Invalid ciphertext size for prepare.");
+        }
+
+        // Allocate once
+        ws.temp0_dup.resize((size_t)2 * n * Q_size_, stream);
+        ws.temp1_ntt.resize((size_t)n * Q_size_ * Q_prime_size_, stream);
+        ws.temp2_acc.resize((size_t)2 * n * Q_prime_size_, stream);
+
+        Data64* temp0_rotation = ws.temp0_dup.data();
+        Data64* temp1_rotation = ws.temp1_ntt.data();
+
+        // 1) Duplicate/layout (c0 → temp0_dup, c1 → expanded across P into temp1_ntt)
+        bfv_duplicate_kernel<<<dim3((n >> 8), Q_size_, 2), 256, 0, stream>>>(
+            input_ct.data(),
+            temp0_rotation,                 // output1 (z==0)
+            temp1_rotation,                 // output2 (z>0; laid out as [Q][P][N])
+            modulus_->data(),
+            n_power,
+            Q_prime_size_ /* rns_mod_count = |P| */
+        );
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        // 2) Forward NTT on temp1_ntt (Q * P blocks)
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = stream
+        };
+
+        gpuntt::GPU_NTT_Inplace(
+            temp1_rotation,
+            ntt_table_->data(),
+            modulus_->data(),
+            cfg_ntt,
+            Q_size_ * Q_prime_size_,   // number of length-N transforms
+            Q_prime_size_              // modulus-stride (your NTT wrapper’s convention)
+        );
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        ws.prepared = true;
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::rotate_rows_method_I_hoisted(
+        BFVKeySwitchHoistedMethodI& ws,                    // prepared once
+        Ciphertext<Scheme::RTF>& input1,                   // same ct used in prepare
+        Ciphertext<Scheme::RTF>& output,                   // per-rotation result
+        Galoiskey<Scheme::RTF>& galois_key,
+        int shift,
+        const cudaStream_t stream)
+    {
+        if (!ws.prepared) {
+            throw std::logic_error("Hoisted workspace not prepared.");
+        }
+        if (input1.relinearization_required_) {
+            throw std::invalid_argument("Ciphertext cannot be rotated (relin required).");
+        }
+        if (input1.in_ntt_domain_ != false) {
+            throw std::invalid_argument("Ciphertext should be in INT domain for Method I.");
+        }
+
+        if (shift == 0) {
+            output = input1;
+            return;
+        }
+
+        int galoiselt = steps_to_galois_elt(shift, n, galois_key.group_order_);
+
+        bool key_exist = (galois_key.storage_type_ == storage_type::DEVICE)
+            ? (galois_key.device_location_.find(galoiselt) != galois_key.device_location_.end())
+            : (galois_key.host_location_.find(galoiselt) != galois_key.host_location_.end());
+
+        if (key_exist) {
+            apply_galois_method_I_with_hoisted(ws, output, galois_key, galoiselt, stream);
+            return;
+        }
+
+        // Decompose shift into powers-of-two rotations (as your original)
+        std::vector<int> required_galoiselt;
+        int shift_num = std::abs(shift);
+        int negative = (shift < 0) ? (-1) : 1;
+
+        while (shift_num != 0) {
+            int power = int(std::log2(shift_num));
+            int power_2 = 1 << power;
+            shift_num -= power_2;
+
+            int index_in = power_2 * negative;
+
+            if (!(galois_key.galois_elt.find(index_in) != galois_key.galois_elt.end())) {
+                throw std::logic_error("Galois key not present!");
+            }
+            required_galoiselt.push_back(galois_key.galois_elt[index_in]);
+        }
+
+        // Chain rotations using *the same hoisted ws*.
+        Ciphertext<Scheme::RTF> *in_ptr = &input1;
+        Ciphertext<Scheme::RTF>  mid, *out_ptr = &output;
+
+        for (size_t k = 0; k < required_galoiselt.size(); ++k) {
+            // write into mid (except last -> output)
+            bool last = (k + 1 == required_galoiselt.size());
+            out_ptr = last ? &output : &mid;
+
+            apply_galois_method_I_with_hoisted(ws, *out_ptr, galois_key, required_galoiselt[k], stream);
+
+            // next hop
+            in_ptr = out_ptr;
+        }
+    }
+
+
     __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
         const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
         int Q_size_, int n_power, cudaStream_t stream)
@@ -869,15 +1176,18 @@ namespace heongpu
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
-            // (A) Baby steps (그대로)
-            std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
-            baby_steps[0] = current_input_ct;
-            for (int j = 1; j < g2; ++j) {
-                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
-                transform_to_ntt_inplace(baby_steps[j], local_opt);
-            }
-            transform_to_ntt_inplace(baby_steps[0], local_opt);
-            auto packed_baby = pack_baby_steps_all(baby_steps, Q_size_, n_power, stream);
+            nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
+            auto packed_baby = pack_baby_steps_all_hoisted_ntt(
+                *this,
+                current_input_ct,              // 회전의 기준
+                g2,
+                galois_key,
+                modulus_->data(),              // Modulus64*   (비-const 포인터)
+                ntt_table_->data(),            // Root<Data64>*
+                n_power,
+                (int)Q_size_,
+                stream);
+            nvtxRangeEnd(rangeBS);
 
             // (B) 이제는 PLAIN 대각선 블롭을 읽는다
             const auto& blob_plain   = matrix_groups_caller[group_idx][0];   // PLAIN diag들
