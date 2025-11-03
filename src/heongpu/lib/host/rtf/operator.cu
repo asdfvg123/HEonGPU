@@ -729,6 +729,77 @@ namespace heongpu
         return acc_ntt;
     }
 
+    // Helper inside HEOperator<Scheme::RTF> (or a free function with access to n, Q_size_, tables)
+    __host__ heongpu::DeviceVector<Data64>
+    HEOperator<Scheme::RTF>::batched_plain_to_ntt_slab(
+        const Data64* base_plain,                 // big blob of all plain diagonals
+        const std::vector<int>& k_list,           // size B: which diagonals to pick
+        cudaStream_t stream)
+    {
+        const int N = static_cast<int>(n);
+        const int Q = static_cast<int>(Q_size_);
+        const int B = static_cast<int>(k_list.size());
+
+        heongpu::DeviceVector<Data64> empty(0, stream);
+        if (B <= 0) return empty;
+
+        // 1) k_list 업로드
+        
+        nvtxRangeId_t rangeA = nvtxRangeStartA("upload k_list");
+        heongpu::DeviceVector<int> d_k_list(B, stream);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            d_k_list.data(), k_list.data(), B * sizeof(int),
+            cudaMemcpyHostToDevice, stream));
+        nvtxRangeEnd(rangeA);
+
+        // 2) gather+threshold → poly-major in [(B*Q)*N]
+        nvtxRangeId_t rangeB = nvtxRangeStartA("gather+threshold");
+        heongpu::DeviceVector<Data64> in_polyBQ_N((size_t)B * Q * N, stream);
+        {
+            dim3 grid((N + 255) / 256, Q, B), blk(256);
+            gather_threshold_to_polymajor_kernel<<<grid, blk, 0, stream>>>(
+                base_plain, d_k_list.data(), in_polyBQ_N.data(),
+                modulus_->data(), upper_halfincrement_->data(), upper_threshold_,
+                n_power, Q, B);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+        nvtxRangeEnd(rangeB);
+
+        // 3) RNS batched NTT: batch_size=B*Q, mod_count=Q (옵션 1의 핵심)
+        heongpu::DeviceVector<Data64> out_polyBQ_N((size_t)B * Q * N, stream);
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = nullptr, // forward에선 사용 안 함
+            .stream = stream
+        };
+
+        gpuntt::GPU_NTT(
+            /*device_in=*/in_polyBQ_N.data(),
+            /*device_out=*/out_polyBQ_N.data(),
+            /*root_of_unity_table=*/ntt_table_->data(),  // 전체 테이블 베이스 포인터 하나면 충분
+            /*modulus=*/modulus_->data(),                // [Q]
+            /*cfg=*/cfg_ntt,
+            /*batch_size=*/B * Q,
+            /*mod_count=*/Q);
+        GPUNTT_CUDA_CHECK(cudaGetLastError());
+
+        // 4) poly-major → slab [B, Q*N]
+        heongpu::DeviceVector<Data64> slab_B_QN((size_t)B * (Q * N), stream);
+        {
+            dim3 grid2((N + 255) / 256, Q, B), blk2(256);
+            repack_poly_to_slab_kernel<<<grid2, blk2, 0, stream>>>(
+                out_polyBQ_N.data(), slab_B_QN.data(),
+                n_power, Q, B);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+
+        return slab_B_QN;
+    }
+
+
     __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
         const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
         int Q_size_, int n_power, cudaStream_t stream)
@@ -760,17 +831,16 @@ namespace heongpu
     {
         nvtx3::scoped_range data_processing_range("bsgs");
 
-        // Stream
+
         cudaStream_t stream = opt.stream_;
-        if (stream == cudaStreamDefault)
-            stream = input.stream();
+        if (stream == cudaStreamDefault) stream = input.stream();
 
         ExecutionOptions local_opt = ExecutionOptions()
                                         .set_stream(stream)
                                         .set_storage_type(storage_type::DEVICE)
                                         .set_initial_location(true);
 
-        // Rotations are in coefficient domain
+        // 회전은 계수영역
         if (input.in_ntt_domain_) {
             transform_from_ntt_inplace(input, local_opt);
         }
@@ -779,11 +849,12 @@ namespace heongpu
         const int H  = N >> 1;
         const int g2 = static_cast<int>(ceil(sqrt(static_cast<double>(H))));
         const int Q  = static_cast<int>(Q_size_);
-        const size_t per_diag_len = static_cast<size_t>(N) * static_cast<size_t>(Q);           // N * Q    (plain diag in NTT/RNS)
-        const size_t per_ct_len   = static_cast<size_t>(Q) << (n_power + 1);                   // 2 * N * Q (cipher)
 
-        // Two groups: original + column-swapped
-        heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig = input;
+        const size_t per_diag_len_plain = static_cast<size_t>(N);                 // PLAIN
+        const size_t per_ct_len         = static_cast<size_t>(Q) << (n_power + 1);// 2*N*Q
+
+        // 원본 + column-swapped
+        heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig   = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
         rotate_columns(input, ct_swapped, galois_key, local_opt);
 
@@ -798,81 +869,116 @@ namespace heongpu
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
-            // (A) Baby steps (rotate in coeff-domain, then NTT)
+            // (A) Baby steps (그대로)
             std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
             baby_steps[0] = current_input_ct;
             for (int j = 1; j < g2; ++j) {
-                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt); // coeff domain
+                rotate_rows(current_input_ct, baby_steps[j], galois_key, j, local_opt);
                 transform_to_ntt_inplace(baby_steps[j], local_opt);
             }
             transform_to_ntt_inplace(baby_steps[0], local_opt);
             auto packed_baby = pack_baby_steps_all(baby_steps, Q_size_, n_power, stream);
-            // (B) Collect diagonals into buckets by giant index i
-            const auto& blob           = matrix_groups_caller[group_idx][0]; // holds all NTT/RNS diagonals
-            const auto& current_shifts = shifts_caller[group_idx];
-            const Data64* base_ptr     = reinterpret_cast<const Data64*>(blob.data());
 
+            // (B) 이제는 PLAIN 대각선 블롭을 읽는다
+            const auto& blob_plain   = matrix_groups_caller[group_idx][0];   // PLAIN diag들
+            const auto& shifts       = shifts_caller[group_idx];
+            const Data64* base_plain = reinterpret_cast<const Data64*>(blob_plain.data());
+
+            // (C) giant index별 버킷
             struct Item { int j; int k; };
-            std::unordered_map<int, std::vector<Item>> buckets; // key = i, value = list of (j,k)
-            buckets.reserve(current_shifts.size());
-
-            for (int k = 0; k < static_cast<int>(current_shifts.size()); ++k) {
-                const int s = current_shifts[k];
+            std::unordered_map<int, std::vector<Item>> buckets;
+            buckets.reserve(shifts.size());
+            for (int k = 0; k < static_cast<int>(shifts.size()); ++k) {
+                const int s = shifts[k];
                 const int r = (s < H) ? s : (s - H);
                 const int j = r % g2;
                 const int i = (r - j) / g2;
                 buckets[i].push_back({j, k});
             }
-
-            if (buckets.empty()) continue;
+            
+            // (D) plain 대각선용 디바이스 버퍼 1개를 미리 잡아두고(길이 N) 매 아이템마다 래핑
+            heongpu::DeviceVector<Data64> diag_plain_buf(static_cast<size_t>(N), stream);
 
             heongpu::Ciphertext<heongpu::Scheme::RTF> group_result;
             bool group_result_initialized = false;
 
-            // (C) Process each bucket: pack inputs for kernel and MAC in NTT
+            // (각 버킷 반복)
             for (auto& kv : buckets) {
+                nvtxRangeId_t rangeGS = nvtxRangeStartA("GS");
+
                 const int i_giant = kv.first;
                 auto& items = kv.second;
-                const int iters = (int)items.size();
-                if (iters == 0) continue;
+                if (items.empty()) continue;
 
-                std::vector<int> h_j_of_iter(iters), h_k_of_iter(iters);
-                for (int t = 0; t < iters; ++t) {
-                    h_j_of_iter[t] = items[t].j;  // 0..g2-1
-                    h_k_of_iter[t] = items[t].k;  // blob 내 diag index
+                // NTT domain 누적자 초기화 (0)
+                heongpu::Ciphertext<heongpu::Scheme::RTF> inner_sum = operator_ciphertext(0);
+                inner_sum.scheme_               = scheme_;
+                inner_sum.ring_size_            = n;
+                inner_sum.coeff_modulus_count_  = Q_size_;
+                inner_sum.cipher_size_          = 2;
+                inner_sum.in_ntt_domain_        = true;
+                inner_sum.ciphertext_generated_ = true;
+                const size_t per_ct_len = (size_t)Q_size_ << (n_power + 1); // 2*N*Q
+                HEONGPU_CUDA_CHECK(cudaMemsetAsync(inner_sum.data(), 0, per_ct_len * sizeof(Data64), stream));
+
+                // 배치 버퍼(재사용 가능하게 밖으로 올려도 OK)
+                const int kBatch = g2; //
+                std::vector<int>  h_j_of_batch(kBatch);
+                std::vector<int>  k_list; k_list.reserve(kBatch);
+                heongpu::DeviceVector<int> d_j_of_batch(kBatch, stream);
+
+                for (int start = 0; start < (int)items.size(); start += kBatch) {
+                    const int B = std::min(kBatch, (int)items.size() - start);
+
+                    k_list.clear();
+                    for (int m = 0; m < B; ++m) {
+                        h_j_of_batch[m] = items[start + m].j;  // baby-step index
+                        k_list.push_back(items[start + m].k);  // which plain diag
+                    }
+                    
+                    nvtxRangeId_t rangeA = nvtxRangeStartA("batch copy diag");
+                    HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                        d_j_of_batch.data(), h_j_of_batch.data(), B*sizeof(int),
+                        cudaMemcpyHostToDevice, stream));
+                    nvtxRangeEnd(rangeA);
+
+                    // === 핵심: 이번 배치의 [B]개 PLAIN 대각선을 RNS-NTT로 한 번에 ===
+                    heongpu::DeviceVector<Data64> diags_ntt_slab =
+                        batched_plain_to_ntt_slab(/*base_plain=*/base_plain, /*k_list=*/k_list, stream);
+                    // diags_ntt_slab: [B, Q*N] (batch-major)
+
+                    // === 한 번의 MAC 커널로 B개 대각선 누적 ===
+                    nvtxRangeId_t rangeC = nvtxRangeStartA("accum");
+                    dim3 grid((N + 255) / 256, Q, 2), blk(256);
+                    cipherplain_multiply_accumulate_block_kernel<<<grid, blk, 0, stream>>>(
+                        packed_baby.data(),            // [g2 * (2*N*Q)]
+                        diags_ntt_slab.data(),         // [B * (Q*N)]
+                        d_j_of_batch.data(),           // [B], 각 대각선의 baby-step j
+                        inner_sum.data(),              // 누적 대상 (NTT domain)
+                        modulus_->data(),              // [Q]
+                        /*M=*/B, (int)Q_size_, n_power);
+                    HEONGPU_CUDA_CHECK(cudaGetLastError());
+                    nvtxRangeEnd(rangeC);
                 }
 
-                heongpu::DeviceVector<int> d_j_of_iter(iters, stream), d_k_of_iter(iters, stream);
-                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(d_j_of_iter.data(), h_j_of_iter.data(),
-                    iters*sizeof(int), cudaMemcpyHostToDevice, stream));
-                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(d_k_of_iter.data(), h_k_of_iter.data(),
-                    iters*sizeof(int), cudaMemcpyHostToDevice, stream));
-
-                heongpu::Ciphertext<heongpu::Scheme::RTF> inner_sum = operator_ciphertext(0);
-                inner_sum.scheme_ = scheme_;
-                inner_sum.ring_size_ = n;
-                inner_sum.coeff_modulus_count_ = Q_size_;
-                inner_sum.cipher_size_ = 2;
-                inner_sum.in_ntt_domain_ = true;
-                inner_sum.ciphertext_generated_ = true;
-
-                dim3 grid((n >> 8), (int)Q_size_, 2), blk(256);
-                cipherplain_multiply_accumulate_idx_kernel<<<grid, blk, 0, stream>>>(
-                    packed_baby.data(),                // 그룹에서 1회 pack
-                    base_ptr,                          // gen_FV_S2C_Matrix() blob
-                    d_j_of_iter.data(), d_k_of_iter.data(),
-                    inner_sum.data(), modulus_->data(),
-                    iters, (int)Q_size_, (int)Q_size_, n_power);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
-
+                
+                nvtxRangeId_t rangeD = nvtxRangeStartA("rotate and add");
+                // coeff domain 복귀, giant 회전, 그룹 합산
                 transform_from_ntt_inplace(inner_sum, local_opt);
                 const int giant_rotation = i_giant * g2;
                 if (giant_rotation) rotate_rows_inplace(inner_sum, galois_key, giant_rotation, local_opt);
-                if (!group_result_initialized) { group_result = std::move(inner_sum); group_result_initialized = true; }
-                else                           { add_inplace(group_result, inner_sum, local_opt); }
+
+                if (!group_result_initialized) {
+                    group_result = std::move(inner_sum);
+                    group_result_initialized = true;
+                } else {
+                    add_inplace(group_result, inner_sum, local_opt);
+                }
+                nvtxRangeEnd(rangeD);
+                nvtxRangeEnd(rangeGS);
             }
 
-            // (F) Accumulate groups
+            // (F) 그룹 누적
             if (group_result_initialized) {
                 if (!result_initialized) {
                     final_result = std::move(group_result);
@@ -1862,6 +1968,17 @@ namespace heongpu
             DeviceVector<Data64>(cipher_memory_size, stream);
 
         return cipher;
+    }
+
+    __host__ heongpu::Plaintext<heongpu::Scheme::RTF>
+    heongpu::HEOperator<heongpu::Scheme::RTF>::operator_plaintext(cudaStream_t stream)
+    {
+        const int N = static_cast<int>(n);
+
+        DeviceVector<Data64> buf(static_cast<size_t>(N), stream);
+
+        heongpu::Plaintext<heongpu::Scheme::RTF> pt(scheme_, buf, /*is_ntt=*/false);
+        return pt;
     }
 
     HEArithmeticOperator<Scheme::RTF>::HEArithmeticOperator(

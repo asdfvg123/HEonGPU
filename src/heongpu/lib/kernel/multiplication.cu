@@ -396,38 +396,176 @@ namespace heongpu
         out[ct_base] = acc;
     }
 
-    __global__ void cipherplain_multiply_accumulate_idx_kernel(
-        const Data64* __restrict__ packed_baby_steps,  // [g2 * (2*N*Q)], 그룹에서 1회만 pack
-        const Data64* __restrict__ base_diagonals,     // gen_FV_S2C_Matrix()의 blob
-        const int*    __restrict__ j_of_iter,          // [iteration_count], 각 it의 baby-step j
-        const int*    __restrict__ k_of_iter,          // [iteration_count], 각 it의 diag k
-        Data64*             out,                       // NTT 결과
-        const Modulus64*    modulus,
-        int iteration_count, int current_decomp_count, int first_decomp_count, int n_power)
+    __global__ void cipherplain_multiply_add_one_idx_kernel(
+        const Data64* __restrict__ packed_baby_steps, // [g2 * (2*N*Q)]
+        const Data64* __restrict__ one_diag_ntt,      // [N*Q] (이번 대각선 NTT)
+        int jslot,                                    // baby-step index
+        Data64* __restrict__ out_ntt,                 // 누적 대상 (NTT domain)
+        const Modulus64* __restrict__ modulus,        // [Q]
+        int current_decomp_count, int n_power)
     {
         const int N    = 1 << n_power;
         const int idx  = blockIdx.x * blockDim.x + threadIdx.x;
-        const int limb = blockIdx.y;
-        const int comp = blockIdx.z;
+        const int limb = blockIdx.y;                   // 0..Q-1
+        const int comp = blockIdx.z;                   // 0..1 (2 polys)
         if (idx >= N) return;
 
-        const int comp_stride = (current_decomp_count << n_power);        // comp jump
-        const int ct_stride   = (current_decomp_count << (n_power + 1));  // per baby-step size
-        const int pt_stride   = (first_decomp_count   << n_power);        // per diag size
+        const int comp_stride = (current_decomp_count << n_power);        // N * Q
+        const int ct_stride   = (current_decomp_count << (n_power + 1));  // 2 * N * Q
 
         const int ct_base = idx + (limb << n_power) + (comp * comp_stride);
         const int pt_base = idx + (limb << n_power);
 
-        Data64 acc = 0ULL;
-        for (int it = 0; it < iteration_count; ++it) {
-            const int jslot = j_of_iter[it];
-            const int kdiag = k_of_iter[it];
+        const Data64 ct   = packed_baby_steps[ct_base + jslot * ct_stride];
+        const Data64 pt   = one_diag_ntt[pt_base];
+
+        const Data64 prod = OPERATOR_GPU_64::mult(ct, pt, modulus[limb]);
+        const Data64 acc  = OPERATOR_GPU_64::add(out_ntt[ct_base], prod, modulus[limb]);
+        out_ntt[ct_base]  = acc;
+    }
+
+    __global__ void cipherplain_multiply_accumulate_block_kernel(
+        const Data64* __restrict__ packed_baby_steps, // [g2 * (2*N*Q)], pack_baby_steps_all 결과
+        const Data64* __restrict__ diags_ntt_slab,    // [M * (N*Q)] 이번 배치의 NTT된 대각선들
+        const int*    __restrict__ j_of_m,            // [M] 각 대각선에 대응되는 baby-step j
+        Data64*       __restrict__ out_ntt,           // 누적 대상 (NTT domain, 2*N*Q)
+        const Modulus64* __restrict__ modulus,        // [Q]
+        int M,                                        // 이번 배치 크기
+        int current_decomp_count,                     // = Q_size_
+        int n_power)
+    {
+        const int N    = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x;
+        const int limb = blockIdx.y;   // 0..Q-1
+        const int comp = blockIdx.z;   // 0..1 (2 polys)
+        if (idx >= N) return;
+
+        const int comp_stride     = (current_decomp_count << n_power);        // N * Q
+        const int ct_stride       = (current_decomp_count << (n_power + 1));  // 2 * N * Q
+        const int per_diag_stride = (current_decomp_count << n_power);        // N * Q  (diag NTT 슬랩 stride)
+
+        const int ct_base = idx + (limb << n_power) + (comp * comp_stride);
+
+        Data64 acc = out_ntt[ct_base];
+
+        // 이번 배치의 모든 (j,m) 항을 한 번에 누적
+        for (int m = 0; m < M; ++m) {
+            const int jslot = j_of_m[m];
+            const int pt_base = idx + (limb << n_power) + (m * per_diag_stride);
+
             const Data64 ct = packed_baby_steps[ct_base + jslot * ct_stride];
-            const Data64 pt = base_diagonals   [pt_base + kdiag * pt_stride];
+            const Data64 pt = diags_ntt_slab[pt_base];
+
             const Data64 prod = OPERATOR_GPU_64::mult(ct, pt, modulus[limb]);
             acc = OPERATOR_GPU_64::add(acc, prod, modulus[limb]);
         }
-        out[ct_base] = acc;
+
+        out_ntt[ct_base] = acc;
     }
 
+    // [B, N]  ->  [Q, B, N]  (limb-major)
+    __global__ void threshold_kernel_batched(
+        const Data64* __restrict__ plains,            // [B * N]
+        Data64*       __restrict__ out_rns,           // [Q * B * N] limb-major
+        const Modulus64* __restrict__ modulus,        // [Q]
+        const Data64* __restrict__ upper_inc,         // [Q]
+        const Data64  upper_thresh,
+        int n_power, int Q, int B)
+    {
+        const int N = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x; // 0..N-1
+        const int limb = blockIdx.y;                            // 0..Q-1
+        const int b    = blockIdx.z;                            // 0..B-1
+        if (idx >= N || limb >= Q || b >= B) return;
+
+        const Data64 v = plains[b * N + idx];
+
+        Data64 w = v;
+        if (v >= upper_thresh)
+            w = OPERATOR_GPU_64::add(v, upper_inc[limb], modulus[limb]);
+
+        // limb-major layout: [limb][b][idx]
+        out_rns[ ((size_t)limb * B + b) * N + idx ] = w;
+    }
+    // [Q, B, N] limb-major  ->  [B, Q*N] batch-major
+    __global__ void repack_limbMajor_to_batchMajor(
+        const Data64* __restrict__ in_rns,   // [Q * B * N]
+        Data64*       __restrict__ out_slab, // [B * (Q*N)]
+        int n_power, int Q, int B)
+    {
+        const int N = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x; // 0..N-1
+        const int limb = blockIdx.y;                             // 0..Q-1
+        const int b    = blockIdx.z;                             // 0..B-1
+        if (idx >= N || limb >= Q || b >= B) return;
+
+        const Data64 v =
+            in_rns[ ((size_t)limb * B + b) * N + idx ];
+
+        // batch-major: [b][limb*N + idx]
+        out_slab[ (size_t)b * (Q * N) + (size_t)limb * N + idx ] = v;
+    }
+    __global__ void threshold_to_polymajor_kernel(
+        const Data64* __restrict__ plains_BN,   // [B*N], b단위로 N씩
+        Data64*       __restrict__ out_polyBQ_N,// [(B*Q)*N]
+        const Modulus64* __restrict__ modulus,  // [Q]
+        const Data64* __restrict__ upper_inc,   // [Q]
+        Data64 upper_thresh, int n_power, int Q, int B)
+    {
+        const int N = 1 << n_power;
+        int idx  = blockIdx.x * blockDim.x + threadIdx.x; // 0..N-1
+        int limb = blockIdx.y; // 0..Q-1
+        int b    = blockIdx.z; // 0..B-1
+        if (idx >= N) return;
+
+        Data64 v = plains_BN[(size_t)b*N + idx];
+        if (v >= upper_thresh)
+            v = OPERATOR_GPU_64::add(v, upper_inc[limb], modulus[limb]);
+
+        int p = b*Q + limb;
+        out_polyBQ_N[(size_t)p*N + idx] = v;
+    }
+    __global__ void repack_poly_to_slab_kernel(
+        const Data64* __restrict__ in_polyBQ_N, // [(B*Q)*N]
+        Data64*       __restrict__ out_slab_B_QN,// [B*(Q*N)]
+        int n_power, int Q, int B)
+    {
+        const int N = 1 << n_power;
+        int idx  = blockIdx.x * blockDim.x + threadIdx.x;
+        int limb = blockIdx.y;
+        int b    = blockIdx.z;
+        if (idx >= N) return;
+
+        int p = b*Q + limb; // poly index
+        Data64 v = in_polyBQ_N[(size_t)p*N + idx];
+
+        // slab: [b][limb*N + idx]
+        out_slab_B_QN[(size_t)b*(Q*N) + (size_t)limb*N + idx] = v;
+    }
+
+    // base_plain[k_list[b]*N + idx] -> in_polyBQ_N[(b*Q + limb)*N + idx]
+    __global__ void gather_threshold_to_polymajor_kernel(
+        const Data64* __restrict__ base_plain,   // [num_diags * N]
+        const int*   __restrict__ k_list,        // [B]
+        Data64*      __restrict__ in_polyBQ_N,   // [(B*Q) * N] (poly-major)
+        const Modulus64* __restrict__ modulus,   // [Q]
+        const Data64* __restrict__ upper_inc,    // [Q]
+        const Data64  upper_thresh,
+        int n_power, int Q, int B)
+    {
+        const int N = 1 << n_power;
+        const int idx  = blockIdx.x * blockDim.x + threadIdx.x; // 0..N-1
+        const int limb = blockIdx.y;                             // 0..Q-1
+        const int b    = blockIdx.z;                             // 0..B-1
+        if (idx >= N || limb >= Q || b >= B) return;
+
+        const int k = k_list[b];
+        Data64 v = base_plain[(size_t)k * N + idx];
+
+        if (v >= upper_thresh)
+            v = OPERATOR_GPU_64::add(v, upper_inc[limb], modulus[limb]);
+
+        const int p = b * Q + limb; // poly index
+        in_polyBQ_N[(size_t)p * N + idx] = v;
+    }
 } // namespace heongpu

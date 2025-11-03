@@ -75,5 +75,51 @@ namespace heongpu
         const Modulus64*    modulus,
         int iteration_count, int current_decomp_count, int first_decomp_count, int n_power);
 
+    __global__ void cipherplain_multiply_add_one_idx_kernel(
+        const Data64* __restrict__ packed_baby_steps, // [g2 * (2*N*Q)]
+        const Data64* __restrict__ one_diag_ntt,      // [N*Q] for this single diagonal
+        int jslot,                                    // baby-step index for this diagonal
+        Data64* __restrict__ out_ntt,                 // accumulator in NTT domain
+        const Modulus64* __restrict__ modulus,        // [Q]
+        int current_decomp_count, int n_power);
+
+    __global__ void cipherplain_multiply_accumulate_block_kernel(
+        const Data64* __restrict__ packed_baby_steps, // [g2 * (2*N*Q)], pack_baby_steps_all 결과
+        const Data64* __restrict__ diags_ntt_slab,    // [M * (N*Q)] 이번 배치의 NTT된 대각선들
+        const int*    __restrict__ j_of_m,            // [M] 각 대각선에 대응되는 baby-step j
+        Data64*       __restrict__ out_ntt,           // 누적 대상 (NTT domain, 2*N*Q)
+        const Modulus64* __restrict__ modulus,        // [Q]
+        int M,                                        // 이번 배치 크기
+        int current_decomp_count,                     // = Q_size_
+        int n_power);
+    __global__ void threshold_kernel_batched(
+        const Data64* __restrict__ plains,            // [B * N]
+        Data64*       __restrict__ out_rns,           // [Q * B * N] limb-major
+        const Modulus64* __restrict__ modulus,        // [Q]
+        const Data64* __restrict__ upper_inc,         // [Q]
+        const Data64  upper_thresh,
+        int n_power, int Q, int B);
+    __global__ void repack_limbMajor_to_batchMajor(
+        const Data64* __restrict__ in_rns,   // [Q * B * N]
+        Data64*       __restrict__ out_slab, // [B * (Q*N)]
+        int n_power, int Q, int B);
+    __global__ void threshold_to_polymajor_kernel(
+        const Data64* __restrict__ plains_BN,   // [B*N], b단위로 N씩
+        Data64*       __restrict__ out_polyBQ_N,// [(B*Q)*N]
+        const Modulus64* __restrict__ modulus,  // [Q]
+        const Data64* __restrict__ upper_inc,   // [Q]
+        Data64 upper_thresh, int n_power, int Q, int B);
+    __global__ void repack_poly_to_slab_kernel(
+        const Data64* __restrict__ in_polyBQ_N, // [(B*Q)*N]
+        Data64*       __restrict__ out_slab_B_QN,// [B*(Q*N)]
+        int n_power, int Q, int B);
+    __global__ void gather_threshold_to_polymajor_kernel(
+        const Data64* __restrict__ base_plain,   // [num_diags * N]
+        const int*   __restrict__ k_list,        // [B]
+        Data64*      __restrict__ in_polyBQ_N,   // [(B*Q) * N] (poly-major)
+        const Modulus64* __restrict__ modulus,   // [Q]
+        const Data64* __restrict__ upper_inc,    // [Q]
+        const Data64  upper_thresh,
+        int n_power, int Q, int B);
 } // namespace heongpu
 #endif // HEONGPU_MULTIPLICATION_H

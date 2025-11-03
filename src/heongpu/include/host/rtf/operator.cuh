@@ -1220,6 +1220,11 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
         
+        __host__ heongpu::DeviceVector<Data64> batched_plain_to_ntt_slab(
+            const Data64* base_plain,                 // big blob of all plain diagonals
+            const std::vector<int>& k_list,           // size B: which diagonals to pick
+            cudaStream_t stream);
+
         __host__ Ciphertext<Scheme::RTF> multiply_matrix_bsgs(
             heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
             const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups,
@@ -1466,6 +1471,9 @@ namespace heongpu
         __host__ Ciphertext<Scheme::RTF>
         operator_from_ciphertext(Ciphertext<Scheme::RTF>& input,
                                  cudaStream_t stream = cudaStreamDefault);
+
+        __host__ Plaintext<Scheme::RTF>
+        operator_plaintext(cudaStream_t stream = cudaStreamDefault);
     };
 
     /**
