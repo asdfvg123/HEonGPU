@@ -609,6 +609,7 @@ namespace heongpu
             dft_matrix_diagonals,
             dft_matrix_shifts,
             galois_key_,
+            galois_key_bs_,
             options
         );
     }

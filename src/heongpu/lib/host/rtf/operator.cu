@@ -829,7 +829,10 @@ namespace heongpu
 
         // Prepare once per ciphertext:
         BFVKeySwitchHoistedMethodI hoisted;
+        
+        nvtxRangeId_t range = nvtxRangeStartA("prepare hoisted");
         op.prepare_keyswitch_hoisted_method_I(input, hoisted, stream);
+        nvtxRangeEnd(range);
 
         nvtxRangeId_t rangeA = nvtxRangeStartA("Copy");
 
@@ -1134,6 +1137,7 @@ namespace heongpu
         const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups_caller,
         const std::vector<std::vector<int>>& shifts_caller,
         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key_bs,
         const ExecutionOptions& opt)
     {
         nvtx3::scoped_range data_processing_range("bsgs");
@@ -1163,7 +1167,7 @@ namespace heongpu
         // 원본 + column-swapped
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig   = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
-        rotate_columns(input, ct_swapped, galois_key, local_opt);
+        rotate_columns(input, ct_swapped, galois_key_bs, local_opt);
 
         std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> inputs;
         inputs.reserve(2);
@@ -1181,7 +1185,7 @@ namespace heongpu
                 *this,
                 current_input_ct,              // 회전의 기준
                 g2,
-                galois_key,
+                galois_key_bs,
                 modulus_->data(),              // Modulus64*   (비-const 포인터)
                 ntt_table_->data(),            // Root<Data64>*
                 n_power,

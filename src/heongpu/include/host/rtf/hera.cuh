@@ -45,6 +45,11 @@ namespace heongpu
                         const ExecutionOptions& options = ExecutionOptions()
                         );
 
+        __host__ void set_galois_key_bs(Galoiskey<Scheme::RTF>& galois_key_bs){
+            galois_key_bs_ = galois_key_bs;
+            galois_key_bs_.store_in_host();
+        };
+
         HEHERA() = default;
         HEHERA(const HEHERA& copy) = default;
         HEHERA(HEHERA&& source) = default;
@@ -338,6 +343,8 @@ namespace heongpu
         
 
         Galoiskey<Scheme::RTF>& galois_key_;
+        Galoiskey<Scheme::RTF> galois_key_bs_;
+
         Relinkey<Scheme::RTF> relin_key_;
         scheme_type scheme_;
 

@@ -168,7 +168,7 @@ int main(int argc, char* argv[])
     std::vector<std::vector<int>> shifts_for_bsgs_M3 = {diags_M3};
 
     heongpu::Ciphertext<Scheme> C_result_bsgs_M3 = operators.multiply_matrix_bsgs(
-        C1, matrix_groups_for_bsgs_M3, shifts_for_bsgs_M3, galois_key);
+        C1, matrix_groups_for_bsgs_M3, shifts_for_bsgs_M3, galois_key, galois_key);
 
     std::vector<uint64_t> vec_result_bsgs_M3;
     {

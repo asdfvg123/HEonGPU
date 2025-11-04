@@ -107,11 +107,12 @@ int main(int argc, char* argv[])
     const int g2 = static_cast<int>(std::ceil(std::sqrt((double)N/2)));
     const int H = static_cast<int>(N/2);
 
-    std::set<int> required_shifts;
+    std::set<int> required_shifts, bs_shifts;
     
-    for(int v=1; v<g2; ++v) required_shifts.insert(v);
+    for(int v=1; v<g2; ++v) bs_shifts.insert(v);
+    bs_shifts.insert(-1);
+
     
-    required_shifts.insert(-1);
     for (int s = 0; s < N; ++s) {
         int r = (s < H) ? s : (s - H);
         const int j = r % g2;
@@ -126,10 +127,18 @@ int main(int argc, char* argv[])
     }
     std::cout << "Number of required Galois shifts: " << required_shifts.size() << std::endl;
     std::vector<int> all_required(required_shifts.begin(), required_shifts.end());
+    std::vector<int> bs_required(bs_shifts.begin(), bs_shifts.end());
+
+    heongpu::Galoiskey<Scheme> galois_key_bs(context, bs_required);
     heongpu::Galoiskey<Scheme> galois_key(context, all_required);
+
+    heongpu::ExecutionOptions opt_device;
+    opt_device.set_storage_type(heongpu::storage_type::HOST);
+    keygen.generate_galois_key(galois_key_bs, secret_key, opt_device);
+
     
     heongpu::ExecutionOptions opt;
-    opt.set_storage_type(heongpu::storage_type::DEVICE);
+    opt.set_storage_type(heongpu::storage_type::HOST);
     keygen.generate_galois_key(galois_key, secret_key, opt);
     std::cout << "Galois keys generated." << std::endl;
     std::cout << "Galois key memory size (bytes): " << galois_key.get_memory_size_in_bytes() << std::endl;
@@ -143,6 +152,7 @@ int main(int argc, char* argv[])
     heongpu::HEArithmeticOperator<Scheme> op(context, encoder);
     heongpu::HEHERA<Scheme> hera(context, contextckks, encoder, encryptor, op, galois_key, relin_key);
 
+    hera.set_galois_key_bs(galois_key_bs);
 
 
     // =========================================================================

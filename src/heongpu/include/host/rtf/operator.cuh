@@ -1278,6 +1278,7 @@ namespace heongpu
             const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups,
             const std::vector<std::vector<int>>& shifts,
             Galoiskey<heongpu::Scheme::RTF>& galois_key,
+            Galoiskey<heongpu::Scheme::RTF>& galois_key_bs,
             const ExecutionOptions& opt = ExecutionOptions()
         );
 
