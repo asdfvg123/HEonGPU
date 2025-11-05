@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <cmath> // For std::pow
+#include <cuda_profiler_api.h>
 
 typedef unsigned long long Data64;
 constexpr auto Scheme = heongpu::Scheme::RTF;
@@ -171,11 +172,12 @@ int main(int argc, char* argv[])
     
     heongpu::Ciphertext<Scheme> ct_in(context);
     encryptor.encrypt(ct_in, pt_in); // slot : [0, 1, 2, 3, ...], coeff : [bigInt, ...,]
-
+ 
 
     hera.gen_FV_S2C_Matrix();
+    cudaProfilerStart();
     auto ct_s2c = hera.S2C_FV(ct_in);
-
+    cudaProfilerStop();
 
     std::vector<uint64_t> message_client(N, 0ULL);
     for (int i = 0; i < N; ++i) message_client[i] = delta * ((i % 16) + (i % 4));

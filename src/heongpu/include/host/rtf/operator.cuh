@@ -20,6 +20,7 @@
 #include "rtf/ciphertext.cuh"
 #include "rtf/evaluationkey.cuh"
 #include <nvtx3/nvtx3.hpp>
+#include <unordered_set>
 namespace heongpu
 {
 
