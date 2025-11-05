@@ -1131,18 +1131,20 @@ namespace heongpu
         return packed;
     }
 
+
+    
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix_bsgs(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
         const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups_caller,
         const std::vector<std::vector<int>>& shifts_caller,
-        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key_gs,
         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key_bs,
         const ExecutionOptions& opt)
     {
         nvtx3::scoped_range data_processing_range("bsgs");
 
-
+        // ---- compute stream 선택 ----
         cudaStream_t stream = opt.stream_;
         if (stream == cudaStreamDefault) stream = input.stream();
 
@@ -1151,20 +1153,17 @@ namespace heongpu
                                         .set_storage_type(storage_type::DEVICE)
                                         .set_initial_location(true);
 
-        // 회전은 계수영역
+        // 회전은 coeff 영역에서 함
         if (input.in_ntt_domain_) {
             transform_from_ntt_inplace(input, local_opt);
         }
 
-        const int N  = static_cast<int>(n);
-        const int H  = N >> 1;
-        const int g2 = static_cast<int>(ceil(sqrt(static_cast<double>(H))));
-        const int Q  = static_cast<int>(Q_size_);
+        const int    N = static_cast<int>(n);
+        const int    H = N >> 1;
+        const int    g2 = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(H))));
+        const size_t Q = static_cast<size_t>(Q_size_);
 
-        const size_t per_diag_len_plain = static_cast<size_t>(N);                 // PLAIN
-        const size_t per_ct_len         = static_cast<size_t>(Q) << (n_power + 1);// 2*N*Q
-
-        // 원본 + column-swapped
+        // 입력 2개(원본, column-swapped)
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig   = input;
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
         rotate_columns(input, ct_swapped, galois_key_bs, local_opt);
@@ -1177,52 +1176,111 @@ namespace heongpu
         heongpu::Ciphertext<heongpu::Scheme::RTF> final_result;
         bool result_initialized = false;
 
+        // ---- H2D 프리페치 스트림 & 이벤트(더블버퍼) ----
+        cudaStream_t h2d_stream;
+        HEONGPU_CUDA_CHECK(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
+        cudaEvent_t key_ready[2];
+        HEONGPU_CUDA_CHECK(cudaEventCreateWithFlags(&key_ready[0], cudaEventDisableTiming));
+        HEONGPU_CUDA_CHECK(cudaEventCreateWithFlags(&key_ready[1], cudaEventDisableTiming));
+
+        auto collect_required_elts_for_shift =
+            [&](const heongpu::Galoiskey<heongpu::Scheme::RTF>& gk, int shift) {
+                std::vector<int> out;
+                // 1) 전체 shift용 galois_elt 계산
+                int galoiselt = steps_to_galois_elt(shift, static_cast<int>(n), gk.group_order_);
+
+                // NOTE: rotate_rows() 쪽에서 shift==0은 이미 처리하지만,
+                // 여기서도 혹시 모를 호출을 대비해 키 존재만 확인.
+                auto exists = (gk.storage_type_ == storage_type::DEVICE)
+                                ? (gk.device_location_.find(galoiselt) != gk.device_location_.end())
+                                : (gk.host_location_.find(galoiselt)    != gk.host_location_.end());
+
+                if (exists) {
+                    // 전체 회전 키가 준비되어 있으면 이거 하나만 필요
+                    out.push_back(galoiselt);
+                    return out;
+                }
+
+                // 2) 없으면 ±2^p 분해
+                int shift_num = std::abs(shift);
+                int negative  = (shift < 0) ? -1 : 1;
+
+                while (shift_num != 0) {
+                    int p       = int(std::log2(shift_num));
+                    int power_2 = 1 << p;
+                    shift_num  -= power_2;
+
+                    int index_in = power_2 * negative; // ±2^p
+                    auto it = gk.galois_elt.find(index_in);
+                    if (it == gk.galois_elt.end()) {
+                        throw std::logic_error("Galois key not present for required shift component");
+                    }
+                    out.push_back(it->second); // 실제 galois_elt id
+                }
+                return out;
+            };
+
+
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
+            // (BS) baby-step 패킹 (여기에서는 별도 프리페치 동기화 없이 기존 함수 사용)
             nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
             auto packed_baby = pack_baby_steps_all_hoisted_ntt(
                 *this,
                 current_input_ct,              // 회전의 기준
                 g2,
                 galois_key_bs,
-                modulus_->data(),              // Modulus64*   (비-const 포인터)
+                modulus_->data(),              // Modulus64* (비-const)
                 ntt_table_->data(),            // Root<Data64>*
                 n_power,
-                (int)Q_size_,
+                static_cast<int>(Q_size_),
                 stream);
             nvtxRangeEnd(rangeBS);
 
-            // (B) 이제는 PLAIN 대각선 블롭을 읽는다
-            const auto& blob_plain   = matrix_groups_caller[group_idx][0];   // PLAIN diag들
-            const auto& shifts       = shifts_caller[group_idx];
+            // (PLAIN) 대각선 blob 및 쉬프트 목록
+            const auto& blob_plain = matrix_groups_caller[group_idx][0];  // PLAIN diag들
+            const auto& shifts     = shifts_caller[group_idx];
             const Data64* base_plain = reinterpret_cast<const Data64*>(blob_plain.data());
+            (void)base_plain; // (예: batched_plain_to_ntt_slab 내부에서 base_plain 사용)
 
-            // (C) giant index별 버킷
+            // (C) i_giant별 버킷: i_giant = floor(r / g2), j = r % g2 (r in [0, H))
             struct Item { int j; int k; };
-            std::unordered_map<int, std::vector<Item>> buckets;
-            buckets.reserve(shifts.size());
+            std::map<int, std::vector<Item>> buckets; // 정렬 보장(회전 프리페치 순서 안정화)
             for (int k = 0; k < static_cast<int>(shifts.size()); ++k) {
                 const int s = shifts[k];
-                const int r = (s < H) ? s : (s - H);
+                const int r = (s < H) ? s : (s - H);   // [0, H) 로 접기
                 const int j = r % g2;
                 const int i = (r - j) / g2;
                 buckets[i].push_back({j, k});
             }
-            
-            // (D) plain 대각선용 디바이스 버퍼 1개를 미리 잡아두고(길이 N) 매 아이템마다 래핑
-            heongpu::DeviceVector<Data64> diag_plain_buf(static_cast<size_t>(N), stream);
 
             heongpu::Ciphertext<heongpu::Scheme::RTF> group_result;
             bool group_result_initialized = false;
 
-            // (각 버킷 반복)
+            // ---- 현재 그룹에서 사용할 giant 회전을 '순서대로' 추출 ----
+            std::vector<int> giant_rotations;      // 실제 회전량 = i_giant * g2
+            giant_rotations.reserve(buckets.size());
+            for (auto& kv : buckets) {
+                const int i_giant = kv.first;
+                giant_rotations.push_back(i_giant * g2);
+            }
+
+            // ---- 첫 회전에 필요한 키 미리 올리기 ----
+            if (!giant_rotations.empty() && giant_rotations[0] != 0) {
+                auto elts0 = collect_required_elts_for_shift(galois_key_gs, giant_rotations[0]);
+                nvtxRangeId_t r0 = nvtxRangeStartA("H2D prefetch keys [0]");
+                galois_key_gs.prefetch_many_async(elts0, h2d_stream, key_ready[0]);
+                nvtxRangeEnd(r0);
+            }
+            // ---- 버킷 처리 루프 (더블버퍼 프리페치 파이프라인) ----
+            int gr_idx = 0; // giant_rotations 인덱스
             for (auto& kv : buckets) {
                 nvtxRangeId_t rangeGS = nvtxRangeStartA("GS");
 
                 const int i_giant = kv.first;
-                auto& items = kv.second;
-                if (items.empty()) continue;
+                auto&     items   = kv.second;
+                if (items.empty()) { nvtxRangeEnd(rangeGS); continue; }
 
                 // NTT domain 누적자 초기화 (0)
                 heongpu::Ciphertext<heongpu::Scheme::RTF> inner_sum = operator_ciphertext(0);
@@ -1235,8 +1293,8 @@ namespace heongpu
                 const size_t per_ct_len = (size_t)Q_size_ << (n_power + 1); // 2*N*Q
                 HEONGPU_CUDA_CHECK(cudaMemsetAsync(inner_sum.data(), 0, per_ct_len * sizeof(Data64), stream));
 
-                // 배치 버퍼(재사용 가능하게 밖으로 올려도 OK)
-                const int kBatch = g2; //
+                // 배치 버퍼
+                const int kBatch = g2;
                 std::vector<int>  h_j_of_batch(kBatch);
                 std::vector<int>  k_list; k_list.reserve(kBatch);
                 heongpu::DeviceVector<int> d_j_of_batch(kBatch, stream);
@@ -1247,23 +1305,24 @@ namespace heongpu
                     k_list.clear();
                     for (int m = 0; m < B; ++m) {
                         h_j_of_batch[m] = items[start + m].j;  // baby-step index
-                        k_list.push_back(items[start + m].k);  // which plain diag
+                        k_list.push_back(items[start + m].k);  // which PLAIN diag
                     }
-                    
+
+                    // j 목록 H2D
                     nvtxRangeId_t rangeA = nvtxRangeStartA("batch copy diag");
                     HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                         d_j_of_batch.data(), h_j_of_batch.data(), B*sizeof(int),
                         cudaMemcpyHostToDevice, stream));
                     nvtxRangeEnd(rangeA);
 
-                    // === 핵심: 이번 배치의 [B]개 PLAIN 대각선을 RNS-NTT로 한 번에 ===
+                    // === PLAIN 대각선들을 한 번에 RNS-NTT 슬랩으로 ===
                     heongpu::DeviceVector<Data64> diags_ntt_slab =
                         batched_plain_to_ntt_slab(/*base_plain=*/base_plain, /*k_list=*/k_list, stream);
-                    // diags_ntt_slab: [B, Q*N] (batch-major)
+                    // layout: [B, Q*N] (batch-major)
 
                     // === 한 번의 MAC 커널로 B개 대각선 누적 ===
                     nvtxRangeId_t rangeC = nvtxRangeStartA("accum");
-                    dim3 grid((N + 255) / 256, Q, 2), blk(256);
+                    dim3 grid((N + 255) / 256, (unsigned)Q, 2), blk(256);
                     cipherplain_multiply_accumulate_block_kernel<<<grid, blk, 0, stream>>>(
                         packed_baby.data(),            // [g2 * (2*N*Q)]
                         diags_ntt_slab.data(),         // [B * (Q*N)]
@@ -1275,24 +1334,41 @@ namespace heongpu
                     nvtxRangeEnd(rangeC);
                 }
 
-                
-                nvtxRangeId_t rangeD = nvtxRangeStartA("rotate and add");
-                // coeff domain 복귀, giant 회전, 그룹 합산
+                // coeff domain 복귀
                 transform_from_ntt_inplace(inner_sum, local_opt);
-                const int giant_rotation = i_giant * g2;
-                if (giant_rotation) rotate_rows_inplace(inner_sum, galois_key, giant_rotation, local_opt);
 
+                // --- giant 회전 ---
+                const int giant_rotation = i_giant * g2;
+
+                if (giant_rotation) {
+                    // (다음) 회전에 필요한 키를 H2D로 미리 올리기
+                    if (gr_idx + 1 < (int)giant_rotations.size() && giant_rotations[gr_idx + 1] != 0) {
+                        auto elts_next = collect_required_elts_for_shift(galois_key_gs, giant_rotations[gr_idx + 1]);
+                        nvtxRangeId_t rpf = nvtxRangeStartA("H2D prefetch keys [next]");
+                        galois_key_gs.prefetch_many_async(elts_next, h2d_stream, key_ready[(gr_idx + 1) & 1]);
+                        nvtxRangeEnd(rpf);
+                    }
+                    // (현재) 회전에 필요한 키 프리페치 완료를 compute stream에서 대기
+                    HEONGPU_CUDA_CHECK(cudaStreamWaitEvent(stream, key_ready[gr_idx & 1], 0));
+
+                    // rotate_rows_inplace 내부에서 apply_galois_method_*가
+                    // 'device 우선' 분기로 방금 올린 device 키를 바로 사용
+                    rotate_rows_inplace(inner_sum, galois_key_gs, giant_rotation, local_opt);
+                }
+
+                // 그룹 누적
                 if (!group_result_initialized) {
                     group_result = std::move(inner_sum);
                     group_result_initialized = true;
                 } else {
                     add_inplace(group_result, inner_sum, local_opt);
                 }
-                nvtxRangeEnd(rangeD);
+
+                ++gr_idx;
                 nvtxRangeEnd(rangeGS);
             }
 
-            // (F) 그룹 누적
+            // (F) 두 서브그룹(원본/스왑) 결과 합산
             if (group_result_initialized) {
                 if (!result_initialized) {
                     final_result = std::move(group_result);
@@ -1303,8 +1379,15 @@ namespace heongpu
             }
         }
 
+        // ---- 프리페치 스트림/이벤트 정리 ----
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(h2d_stream));
+        HEONGPU_CUDA_CHECK(cudaEventDestroy(key_ready[0]));
+        HEONGPU_CUDA_CHECK(cudaEventDestroy(key_ready[1]));
+        HEONGPU_CUDA_CHECK(cudaStreamDestroy(h2d_stream));
+
         return final_result;
     }
+
 
     __host__ void HEOperator<Scheme::RTF>::relinearize_seal_method_inplace(
         Ciphertext<Scheme::RTF>& input1, Relinkey<Scheme::RTF>& relin_key,
@@ -1654,24 +1737,35 @@ namespace heongpu
         // TODO: make it efficient
         int iteration_count_1 = Q_size_ / 4;
         int iteration_count_2 = Q_size_ % 4;
-        if (galois_key.storage_type_ == storage_type::DEVICE)
-        {
+        auto it = galois_key.device_location_.find(galois_elt);
+        if (it != galois_key.device_location_.end()) {
             keyswitch_multiply_accumulate_kernel<<<
                 dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
-                temp1_rotation, galois_key.device_location_[galois_elt].data(),
-                temp2_rotation, modulus_->data(), n_power, Q_prime_size_,
-                iteration_count_1, iteration_count_2);
+                temp1_rotation,
+                it->second.data(),                 // <- prefetched device key
+                temp2_rotation, modulus_->data(),
+                n_power, Q_prime_size_, iteration_count_1, iteration_count_2);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
         }
-        else
-        {
+        // 2) 전역 storage_type이 DEVICE면 기존 경로
+        else if (galois_key.storage_type_ == storage_type::DEVICE) {
+            keyswitch_multiply_accumulate_kernel<<<
+                dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
+                temp1_rotation,
+                galois_key.device_location_[galois_elt].data(),
+                temp2_rotation, modulus_->data(),
+                n_power, Q_prime_size_, iteration_count_1, iteration_count_2);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+        // 3) 아니면 HOST→DEVICE 임시 복사 (기존 경로)
+        else {
             DeviceVector<Data64> key_location(
                 galois_key.host_location_[galois_elt], stream);
             keyswitch_multiply_accumulate_kernel<<<
                 dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
                 temp1_rotation, key_location.data(), temp2_rotation,
-                modulus_->data(), n_power, Q_prime_size_, iteration_count_1,
-                iteration_count_2);
+                modulus_->data(), n_power, Q_prime_size_,
+                iteration_count_1, iteration_count_2);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
         }
 

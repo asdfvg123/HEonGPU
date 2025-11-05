@@ -125,6 +125,10 @@ int main(int argc, char* argv[])
         long long row_rotation_amount = effective_rot % N_div_2;
         if (row_rotation_amount != 0) required_shifts.insert(static_cast<int>(row_rotation_amount));
     }
+    for(auto v : required_shifts) {
+        std::cout << v << " ";
+    }
+    std::cout << std::endl;
     std::cout << "Number of required Galois shifts: " << required_shifts.size() << std::endl;
     std::vector<int> all_required(required_shifts.begin(), required_shifts.end());
     std::vector<int> bs_required(bs_shifts.begin(), bs_shifts.end());

@@ -664,6 +664,36 @@ namespace heongpu
 
         void load(std::istream& is);
 
+
+        inline bool has_device_elt(int galois_elt) const {
+            return (device_location_.find(galois_elt) != device_location_.end());
+        }
+
+        inline void prefetch_one_async(int galois_elt, cudaStream_t h2d_stream /*= cudaStreamPerThread*/) {
+            if (has_device_elt(galois_elt)) return;
+            if (storage_type_ == storage_type::DEVICE) return;
+
+            auto hit = host_location_.find(galois_elt);
+            if (hit == host_location_.end()) {
+                throw std::logic_error("prefetch_one_async: host key not present for galois_elt");
+            }
+            device_location_.emplace(galois_elt, DeviceVector<Data64>(hit->second, h2d_stream));
+        }
+
+        inline void prefetch_many_async(const std::vector<int>& elts, cudaStream_t h2d_stream) {
+            for (int e : elts) prefetch_one_async(e, h2d_stream);
+        }
+
+        inline void prefetch_many_async(const std::vector<int>& elts,
+                                        cudaStream_t h2d_stream, cudaEvent_t done_event) {
+            for (int e : elts) prefetch_one_async(e, h2d_stream);
+            cudaError_t err = cudaEventRecord(done_event, h2d_stream);
+            if (err != cudaSuccess) {
+                throw std::runtime_error("prefetch_many_async: cudaEventRecord failed");
+            }
+        }
+
+        
       private:
         scheme_type scheme_;
         keyswitching_type key_type;
