@@ -1270,6 +1270,18 @@ namespace heongpu
             int Q,
             cudaStream_t stream);
 
+
+        __host__ heongpu::DeviceVector<Data64>
+        pack_baby_steps_all_pow2_chain(
+            heongpu::Ciphertext<heongpu::Scheme::RTF>  input,
+            int g2,
+            heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key_bs,
+            Modulus64* modulus_array,        // gpuntt::Modulus<Data64>*
+            Root<Data64>* root_table,        // gpuntt::Root<Data64>*
+            int n_power,
+            int Q,
+            cudaStream_t stream);
+
         __host__ heongpu::DeviceVector<Data64>
             pack_baby_steps_all_hoisted_ntt(
                 heongpu::HEOperator<heongpu::Scheme::RTF>& op,            // 연산자 (rotate/NTT 호출용)

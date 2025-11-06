@@ -1268,26 +1268,6 @@ namespace heongpu
         return baby_ntt_concat;
     }
 
-    __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
-        const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
-        int Q_size_, int n_power, cudaStream_t stream)
-    {
-        const size_t per_ct_len = static_cast<size_t>(Q_size_) << (n_power + 1); // 2 * N * Q
-        const size_t total_len  = per_ct_len * baby_steps.size();
-
-        heongpu::DeviceVector<Data64> packed(total_len, stream);
-
-        for (size_t j = 0; j < baby_steps.size(); ++j) {
-            const Data64* src = baby_steps[j].data(); 
-            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                packed.data() + j * per_ct_len,
-                src,
-                per_ct_len * sizeof(Data64),
-                cudaMemcpyDeviceToDevice,
-                stream));
-        }
-        return packed;
-    }
 
     static inline int floor_log2_u32(unsigned x) {
     #if defined(__GNUC__)
@@ -1307,7 +1287,6 @@ namespace heongpu
         }
         return steps;
     }
-    
 
     void rotate_rows_via_pow2(
         heongpu::HEOperator<heongpu::Scheme::RTF>& op,
@@ -1330,6 +1309,171 @@ namespace heongpu
         }
         ct_out = use_a_as_in ? a : b; // 마지막으로 쓴 쪽을 반환
     }
+
+    __host__ heongpu::DeviceVector<Data64>
+    heongpu::HEOperator<heongpu::Scheme::RTF>::pack_baby_steps_all_pow2_chain(
+        heongpu::Ciphertext<heongpu::Scheme::RTF>  input,
+        int g2,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key_bs,
+        Modulus64* modulus_array,        // gpuntt::Modulus<Data64>*
+        Root<Data64>* root_table,        // gpuntt::Root<Data64>*
+        int n_power,
+        int Q,
+        cudaStream_t stream)
+    {
+        if (g2 <= 0) {
+            return heongpu::DeviceVector<Data64>(); // 빈 결과
+        }
+
+        const int    N          = 1 << n_power;
+        const size_t per_ct_len = (size_t)2 * N * Q;   // 2 components * N * Q
+
+        auto local_opt = heongpu::ExecutionOptions()
+                            .set_stream(stream)
+                            .set_storage_type(heongpu::storage_type::DEVICE)
+                            .set_initial_location(true);
+
+        // 0) 입력을 계수 영역으로 맞추기 (원래 코드와 동일한 전제)
+        if (input.in_ntt_domain_) {
+            transform_from_ntt_inplace(input, local_opt);
+        }
+
+        // 1) baby ciphertext 배열: babies[j] = rotation-by-j(ct)
+        std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> babies(g2);
+
+        // S: 이미 생성된 rotation 인덱스 집합
+        std::vector<int> S;
+        S.reserve(g2);
+
+        // 초기 상태: S = {0}, babies[0] = input
+        {
+            nvtxRangeId_t r_init = nvtxRangeStartA("BS_init");
+            babies[0] = input;      // 깊은 복사(라이브러리 구현에 따라) or 핸들 복사
+            S.push_back(0);
+            nvtxRangeEnd(r_init);
+        }
+
+        // 2) step = 1,2,4,8,... 로 S를 확장하면서 babies 채우기
+        int step = 1;
+        while (step < g2) {
+            char range_name[64];
+            std::snprintf(range_name, sizeof(range_name), "BS_step_%d", step);
+            nvtxRangeId_t range_step = nvtxRangeStartA(range_name);
+
+            // 현재 단계에서의 "기존" S만 사용해야 하므로 snapshot 길이 저장
+            const size_t prev_size = S.size();
+
+            for (size_t idx = 0; idx < prev_size; ++idx) {
+                int base_idx   = S[idx];
+                int target_idx = base_idx + step;
+
+                if (target_idx >= g2) {
+                    continue;
+                }
+
+                // 이미 생성된 경우(이론상 없겠지만) 안전하게 스킵
+                if (babies[target_idx].memory_size() != 0) {
+                    continue;
+                }
+
+                auto& src = babies[base_idx];
+                auto& dst = babies[target_idx];
+
+                // 필요하다면 여기서 dst를 미리 resize 해줄 수도 있음
+                // dst.resize(per_ct_len, stream);  // Ciphertext 구현에 따라 조정
+
+                // rotate_rows_via_pow2:
+                //   dst = Rot^{step}(src)
+                rotate_rows_via_pow2(
+                    *this,
+                    src,
+                    dst,
+                    galois_key_bs,
+                    step,
+                    local_opt);
+
+                // 여기서는 hoist 안 함! 그냥 rotated ciphertext만 저장.
+                S.push_back(target_idx);
+            }
+
+            nvtxRangeEnd(range_step);
+            step <<= 1;
+        }
+
+        // 여기까지 오면 babies[0..g2-1] 이 모두 coeff-domain 에 존재해야 함.
+        // (g2가 2^k가 아니어도, 1/2/4/... 체인으로 0..g2-1 채워짐)
+
+        // 3) baby steps를 하나의 coeff concat 버퍼에 복사
+        heongpu::DeviceVector<Data64> baby_coeff_concat((size_t)per_ct_len * g2, stream);
+
+        {
+            nvtxRangeId_t r_copy = nvtxRangeStartA("BS_concat_copy");
+            for (int j = 0; j < g2; ++j) {
+                // 방어적 체크 (디버그용)
+                // if (babies[j].memory_size() < per_ct_len) { ... 에러 처리 ... }
+
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    baby_coeff_concat.data() + (size_t)j * per_ct_len,
+                    babies[j].data(),
+                    per_ct_len * sizeof(Data64),
+                    cudaMemcpyDeviceToDevice,
+                    stream));
+            }
+            nvtxRangeEnd(r_copy);
+        }
+
+        // 4) Batched NTT: 모든 baby steps를 한 번에 NTT-domain 으로
+        heongpu::DeviceVector<Data64> baby_ntt_concat((size_t)per_ct_len * g2, stream);
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power        = n_power,
+            .ntt_type       = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding   = false,
+            .mod_inverse    = nullptr,
+            .stream         = stream
+        };
+
+        {
+            nvtxRangeId_t r_ntt = nvtxRangeStartA("BS_batched_NTT");
+            gpuntt::GPU_NTT(
+                /*device_in=*/baby_coeff_concat.data(),
+                /*device_out=*/baby_ntt_concat.data(),
+                /*root_of_unity_table=*/root_table,
+                /*modulus=*/modulus_array,
+                /*cfg=*/cfg_ntt,
+                /*batch_size=*/g2 * 2 * Q,
+                /*mod_count=*/Q);
+            GPUNTT_CUDA_CHECK(cudaGetLastError());
+            nvtxRangeEnd(r_ntt);
+        }
+
+        return baby_ntt_concat;
+    }
+
+    __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
+        const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
+        int Q_size_, int n_power, cudaStream_t stream)
+    {
+        const size_t per_ct_len = static_cast<size_t>(Q_size_) << (n_power + 1); // 2 * N * Q
+        const size_t total_len  = per_ct_len * baby_steps.size();
+
+        heongpu::DeviceVector<Data64> packed(total_len, stream);
+
+        for (size_t j = 0; j < baby_steps.size(); ++j) {
+            const Data64* src = baby_steps[j].data(); 
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                packed.data() + j * per_ct_len,
+                src,
+                per_ct_len * sizeof(Data64),
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+        return packed;
+    }
+
+    
+
 
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix_bsgs(
@@ -1421,14 +1565,24 @@ namespace heongpu
             // auto packed_baby = pack_baby_steps_all(
             //     baby_steps, static_cast<int>(Q_size_), n_power, stream);
             // nvtxRangeEnd(rangeBS);
-
-
-            nvtxRangeId_t rangeBS = nvtxRangeStartA("BS_chain");
-            auto packed_baby = pack_baby_steps_all_hoisted_chain(
-                *this, current_input_ct, g2, galois_key_bs,
-                modulus_->data(), ntt_table_->data(),
-                n_power, static_cast<int>(Q_size_), stream);
+            nvtxRangeId_t rangeBS = nvtxRangeStartA("BS_chain_nohoist");
+            auto packed_baby = pack_baby_steps_all_pow2_chain(
+                current_input_ct,
+                g2,
+                galois_key_bs,
+                modulus_->data(),
+                ntt_table_->data(),
+                n_power,
+                static_cast<int>(Q_size_),
+                stream);
             nvtxRangeEnd(rangeBS);
+
+            // nvtxRangeId_t rangeBS = nvtxRangeStartA("BS_chain");
+            // auto packed_baby = pack_baby_steps_all_hoisted_chain(
+            //     *this, current_input_ct, g2, galois_key_bs,
+            //     modulus_->data(), ntt_table_->data(),
+            //     n_power, static_cast<int>(Q_size_), stream);
+            // nvtxRangeEnd(rangeBS);
 
             const auto& blob_plain = matrix_groups_caller[group_idx][0];
             const auto& shifts     = shifts_caller[group_idx];

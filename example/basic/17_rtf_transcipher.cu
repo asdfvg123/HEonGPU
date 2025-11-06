@@ -110,7 +110,7 @@ int main(int argc, char* argv[])
 
     std::set<int> required_shifts, bs_shifts;
     
-    bs_shifts.insert(-1);
+    // bs_shifts.insert(-1);
     // for(int v=1; v<g2; ++v) bs_shifts.insert(v);
     bs_shifts.insert(1);
     bs_shifts.insert(2);
