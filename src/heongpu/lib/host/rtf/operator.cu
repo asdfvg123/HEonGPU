@@ -1110,6 +1110,164 @@ namespace heongpu
     }
 
 
+    __host__ heongpu::DeviceVector<Data64>
+    heongpu::HEOperator<heongpu::Scheme::RTF>::pack_baby_steps_all_hoisted_chain(
+        heongpu::HEOperator<heongpu::Scheme::RTF>& op,
+        heongpu::Ciphertext<heongpu::Scheme::RTF>  input,
+        int g2,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+        Modulus64* modulus_array,       // gpuntt::Modulus<Data64>*
+        Root<Data64>* root_table,       // gpuntt::Root<Data64>*
+        int n_power,
+        int Q,
+        cudaStream_t stream)
+    {
+        const int    N          = 1 << n_power;
+        const size_t per_ct_len = (size_t)2 * N * Q;   // 2 components * N * Q
+
+        auto local_opt = heongpu::ExecutionOptions()
+                            .set_stream(stream)
+                            .set_storage_type(heongpu::storage_type::DEVICE)
+                            .set_initial_location(true);
+
+        // 0) 입력을 계수 영역으로 통일
+        if (input.in_ntt_domain_) {
+            op.transform_from_ntt_inplace(input, local_opt);
+        }
+
+        // baby steps 저장: index j -> rotation j 가 적용된 ciphertext
+        std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> babies(g2);
+        // 각 baby에 대한 hoisted workspace
+        std::vector<BFVKeySwitchHoistedMethodI> hoisted_ws(g2);
+
+        // S: 현재까지 만들어진 rotation index 집합
+        std::vector<int> S;
+        S.reserve(g2);
+
+        // 새로 추가되는 인덱스를 임시로 담을 버퍼
+        std::vector<int> S_new;
+        S_new.reserve(g2);
+
+        // === 1. 초기 상태: S = {0}, input hoist ===
+        {
+            nvtxRangeId_t r0 = nvtxRangeStartA("BS_init_hoist");
+            babies[0] = input;  // 메타 포함 copy (또는 move 가능하면 move)
+            op.prepare_keyswitch_hoisted_method_I(babies[0], hoisted_ws[0], stream);
+            nvtxRangeEnd(r0);
+        }
+        S.push_back(0);
+
+        // === 2. step = 1,2,4,... 로 S 전체를 rotate 하며 집합 확장 ===
+        // 각 step마다: 모든 s ∈ S에 대해, t = s + step < g2 이면
+        //   babies[t] = rotate(babies[s], step) using hoisted_ws[s]
+        //   hoisted_ws[t] = hoist(babies[t])
+        //   t 를 S_new에 추가
+        int step = 1;
+
+        while (step < g2) {
+            nvtxRangeId_t range_step;
+            {
+                char name[64];
+                std::snprintf(name, sizeof(name), "BS_step_%d", step);
+                range_step = nvtxRangeStartA(name);
+            }
+
+            S_new.clear();
+
+            for (int base_idx : S) {
+                int target_idx = base_idx + step;
+                if (target_idx >= g2)
+                    continue;
+
+                // base ciphertext & workspace
+                auto& base_ct = babies[base_idx];
+                auto& base_ws = hoisted_ws[base_idx];
+
+                // 이미 만들어졌다면 스킵 (이론상 안 생겨야 하지만 안전장치)
+                if (babies[target_idx].memory_size() != 0) {
+                    continue;
+                }
+
+                // --- rotate: babies[target_idx] = Rot_step(babies[base_idx]) ---
+                heongpu::Ciphertext<heongpu::Scheme::RTF>& out_ct = babies[target_idx];
+
+                op.rotate_rows_method_I_hoisted(
+                    base_ws,          // hoisted data for base_ct
+                    base_ct,          // source ct
+                    out_ct,           // dest ct (자동 resize 가정)
+                    galois_key,
+                    step,             // 회전량
+                    stream);
+
+                // out_ct 는 coeff domain 이라고 가정 (Method I 설계 상)
+
+                // --- 새 baby에 대해 hoist 준비 (다음 단계에서 재사용) ---
+                op.prepare_keyswitch_hoisted_method_I(
+                    out_ct,
+                    hoisted_ws[target_idx],
+                    stream);
+
+                S_new.push_back(target_idx);
+            }
+
+            // S <- S ∪ S_new
+            S.insert(S.end(), S_new.begin(), S_new.end());
+
+            nvtxRangeEnd(range_step);
+            step <<= 1;
+        }
+
+        // 여기까지 오면 babies[0..g2-1] 가 coeff domain 에서 채워져 있어야 함.
+        // (g2가 2^k가 아니어도 위 루프에서 0..g2-1 전부 생성됨)
+
+        // === 3. baby steps 전부를 하나의 concat 버퍼에 복사 ===
+        heongpu::DeviceVector<Data64> baby_coeff_concat((size_t)per_ct_len * g2, stream);
+
+        {
+            nvtxRangeId_t r_copy = nvtxRangeStartA("BS_concat_copy");
+            for (int j = 0; j < g2; ++j) {
+                // 안전 차원에서 사이즈 체크 (옵션)
+                // assert(babies[j].memory_size() >= per_ct_len);
+
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    baby_coeff_concat.data() + (size_t)j * per_ct_len,
+                    babies[j].data(),
+                    per_ct_len * sizeof(Data64),
+                    cudaMemcpyDeviceToDevice,
+                    stream));
+            }
+            nvtxRangeEnd(r_copy);
+        }
+
+        // === 4. Batched NTT 로 한 번에 NTT-domain baby steps 생성 ===
+        heongpu::DeviceVector<Data64> baby_ntt_concat((size_t)per_ct_len * g2, stream);
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power        = n_power,
+            .ntt_type       = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding   = false,
+            .mod_inverse    = nullptr,
+            .stream         = stream
+        };
+
+        {
+            nvtxRangeId_t r_ntt = nvtxRangeStartA("BS_batched_NTT");
+            gpuntt::GPU_NTT(
+                /*device_in=*/baby_coeff_concat.data(),
+                /*device_out=*/baby_ntt_concat.data(),
+                /*root_of_unity_table=*/root_table,
+                /*modulus=*/modulus_array,
+                /*cfg=*/cfg_ntt,
+                /*batch_size=*/g2 * 2 * Q,
+                /*mod_count=*/Q);
+            GPUNTT_CUDA_CHECK(cudaGetLastError());
+            nvtxRangeEnd(r_ntt);
+        }
+
+        return baby_ntt_concat;
+    }
+
     __host__ static heongpu::DeviceVector<Data64> pack_baby_steps_all(
         const std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>>& baby_steps,
         int Q_size_, int n_power, cudaStream_t stream)
@@ -1139,12 +1297,11 @@ namespace heongpu
     #endif
     }
 
-    // s (>0)를 2의 거듭제곱 합으로 분해: 예) 13 -> {8,4,1}
     static inline std::vector<int> decompose_pow2_positive(int s) {
         std::vector<int> steps;
         while (s) {
             int p  = floor_log2_u32((unsigned)s);
-            int p2 = 1 << p;           // pow(2,p) 절대 쓰지 말 것(부동소수 오차 회피)
+            int p2 = 1 << p;           
             steps.push_back(p2);
             s -= p2;
         }
@@ -1221,7 +1378,6 @@ namespace heongpu
         HEONGPU_CUDA_CHECK(cudaEventCreateWithFlags(&key_ready[0], cudaEventDisableTiming));
         HEONGPU_CUDA_CHECK(cudaEventCreateWithFlags(&key_ready[1], cudaEventDisableTiming));
 
-        // rotate_method_I와 동일 규칙의 elt 수집
         auto collect_required_elts_for_shift =
             [&](const heongpu::Galoiskey<heongpu::Scheme::RTF>& gk, int shift) {
                 std::vector<int> out;
@@ -1257,27 +1413,22 @@ namespace heongpu
             // std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
             // baby_steps[0] = current_input_ct;
             // for (int j = 1; j < g2; ++j) {
-            //     rotate_rows(current_input_ct, baby_steps[j], galois_key_bs, j, local_opt);
+            //     rotate_rows_via_pow2(*this, current_input_ct, baby_steps[j], galois_key_bs, j, local_opt);
             //     transform_to_ntt_inplace(baby_steps[j], local_opt);
             // }
             // transform_to_ntt_inplace(baby_steps[0], local_opt);
+
             // auto packed_baby = pack_baby_steps_all(
             //     baby_steps, static_cast<int>(Q_size_), n_power, stream);
             // nvtxRangeEnd(rangeBS);
 
-            nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
-            std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
-            baby_steps[0] = current_input_ct;
-            for (int j = 1; j < g2; ++j) {
-                rotate_rows_via_pow2(*this, current_input_ct, baby_steps[j], galois_key_bs, j, local_opt);
-                transform_to_ntt_inplace(baby_steps[j], local_opt);
-            }
-            transform_to_ntt_inplace(baby_steps[0], local_opt);
 
-            auto packed_baby = pack_baby_steps_all(
-                baby_steps, static_cast<int>(Q_size_), n_power, stream);
+            nvtxRangeId_t rangeBS = nvtxRangeStartA("BS_chain");
+            auto packed_baby = pack_baby_steps_all_hoisted_chain(
+                *this, current_input_ct, g2, galois_key_bs,
+                modulus_->data(), ntt_table_->data(),
+                n_power, static_cast<int>(Q_size_), stream);
             nvtxRangeEnd(rangeBS);
-
 
             const auto& blob_plain = matrix_groups_caller[group_idx][0];
             const auto& shifts     = shifts_caller[group_idx];

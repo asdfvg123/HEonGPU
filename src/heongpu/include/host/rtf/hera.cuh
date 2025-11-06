@@ -47,7 +47,7 @@ namespace heongpu
 
         __host__ void set_galois_key_bs(Galoiskey<Scheme::RTF>& galois_key_bs){
             galois_key_bs_ = galois_key_bs;
-            galois_key_bs_.store_in_host();
+            galois_key_bs_.store_in_device();
         };
 
         HEHERA() = default;

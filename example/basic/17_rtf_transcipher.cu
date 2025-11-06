@@ -120,7 +120,6 @@ int main(int argc, char* argv[])
     bs_shifts.insert(32);
     bs_shifts.insert(64);
     bs_shifts.insert(128);
-    bs_shifts.insert(256);
  
     
     for (int s = 0; s < N; ++s) {
