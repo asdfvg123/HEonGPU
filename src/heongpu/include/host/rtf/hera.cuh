@@ -50,6 +50,20 @@ namespace heongpu
             galois_key_bs_.store_in_device();
         };
 
+        __host__ void reset_galois_key_bs(Galoiskey<Scheme::RTF>& galois_key_bs)
+        {
+            galois_key_bs.device_location_.clear();
+
+            galois_key_bs.host_location_.clear();
+            galois_key_bs.zero_device_location_ =
+                decltype(galois_key_bs.zero_device_location_)();
+            galois_key_bs.zero_host_location_.clear();
+
+            galois_key_bs.galoiskey_size_ = 0;
+            galois_key_bs.galois_key_generated_ = false;
+
+            galois_key_bs.storage_type_ = storage_type::HOST;
+        }
         HEHERA() = default;
         HEHERA(const HEHERA& copy) = default;
         HEHERA(HEHERA&& source) = default;

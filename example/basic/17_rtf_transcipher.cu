@@ -187,6 +187,8 @@ int main(int argc, char* argv[])
     auto ct_s2c = hera.S2C_FV(ct_in);
     cudaProfilerStop();
 
+    hera.reset_galois_key_bs(galois_key_bs); 
+
     std::vector<uint64_t> message_client(N, 0ULL);
     for (int i = 0; i < N; ++i) message_client[i] = delta * ((i % 16) + (i % 4));
     print_first("(message_client)", message_client, 32);
