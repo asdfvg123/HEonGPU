@@ -110,9 +110,18 @@ int main(int argc, char* argv[])
 
     std::set<int> required_shifts, bs_shifts;
     
-    for(int v=1; v<g2; ++v) bs_shifts.insert(v);
     bs_shifts.insert(-1);
-
+    // for(int v=1; v<g2; ++v) bs_shifts.insert(v);
+    bs_shifts.insert(1);
+    bs_shifts.insert(2);
+    bs_shifts.insert(4);
+    bs_shifts.insert(8);
+    bs_shifts.insert(16);
+    bs_shifts.insert(32);
+    bs_shifts.insert(64);
+    bs_shifts.insert(128);
+    bs_shifts.insert(256);
+ 
     
     for (int s = 0; s < N; ++s) {
         int r = (s < H) ? s : (s - H);
@@ -138,12 +147,12 @@ int main(int argc, char* argv[])
     heongpu::Galoiskey<Scheme> galois_key(context, all_required);
 
     heongpu::ExecutionOptions opt_device;
-    opt_device.set_storage_type(heongpu::storage_type::HOST);
+    opt_device.set_storage_type(heongpu::storage_type::DEVICE);
     keygen.generate_galois_key(galois_key_bs, secret_key, opt_device);
 
     
     heongpu::ExecutionOptions opt;
-    opt.set_storage_type(heongpu::storage_type::HOST);
+    opt.set_storage_type(heongpu::storage_type::DEVICE);
     keygen.generate_galois_key(galois_key, secret_key, opt);
     std::cout << "Galois keys generated." << std::endl;
     std::cout << "Galois key memory size (bytes): " << galois_key.get_memory_size_in_bytes() << std::endl;

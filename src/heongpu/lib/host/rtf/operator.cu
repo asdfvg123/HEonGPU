@@ -1131,8 +1131,49 @@ namespace heongpu
         return packed;
     }
 
+    static inline int floor_log2_u32(unsigned x) {
+    #if defined(__GNUC__)
+        return 31 - __builtin_clz(x);
+    #else
+        int p = -1; while (x) { x >>= 1; ++p; } return p;
+    #endif
+    }
 
+    // s (>0)를 2의 거듭제곱 합으로 분해: 예) 13 -> {8,4,1}
+    static inline std::vector<int> decompose_pow2_positive(int s) {
+        std::vector<int> steps;
+        while (s) {
+            int p  = floor_log2_u32((unsigned)s);
+            int p2 = 1 << p;           // pow(2,p) 절대 쓰지 말 것(부동소수 오차 회피)
+            steps.push_back(p2);
+            s -= p2;
+        }
+        return steps;
+    }
     
+
+    void rotate_rows_via_pow2(
+        heongpu::HEOperator<heongpu::Scheme::RTF>& op,
+        const heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
+        heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_out,
+        heongpu::Galoiskey<heongpu::Scheme::RTF>& gk,
+        int s,
+        const heongpu::ExecutionOptions& opt)
+    {
+        if (s == 0) { ct_out = ct_in; return; }
+        std::vector<int> steps = decompose_pow2_positive(s);
+
+        heongpu::Ciphertext<heongpu::Scheme::RTF> a = ct_in, b;
+        bool use_a_as_in = true;
+        for (size_t i = 0; i < steps.size(); ++i) {
+            auto& in  = use_a_as_in ? a : b;
+            auto& out = use_a_as_in ? b : a;
+            op.rotate_rows(in, out, gk, steps[i], opt);
+            use_a_as_in = !use_a_as_in;
+        }
+        ct_out = use_a_as_in ? a : b; // 마지막으로 쓴 쪽을 반환
+    }
+
     __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix_bsgs(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
@@ -1205,12 +1246,38 @@ namespace heongpu
         for (int group_idx = 0; group_idx < 2; ++group_idx) {
             auto& current_input_ct = inputs[group_idx];
 
+            // nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
+            // auto packed_baby = pack_baby_steps_all_hoisted_ntt(
+            //     *this, current_input_ct, g2, galois_key_bs,
+            //     modulus_->data(), ntt_table_->data(),
+            //     n_power, static_cast<int>(Q_size_), stream);
+            // nvtxRangeEnd(rangeBS);
+
+            // nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
+            // std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
+            // baby_steps[0] = current_input_ct;
+            // for (int j = 1; j < g2; ++j) {
+            //     rotate_rows(current_input_ct, baby_steps[j], galois_key_bs, j, local_opt);
+            //     transform_to_ntt_inplace(baby_steps[j], local_opt);
+            // }
+            // transform_to_ntt_inplace(baby_steps[0], local_opt);
+            // auto packed_baby = pack_baby_steps_all(
+            //     baby_steps, static_cast<int>(Q_size_), n_power, stream);
+            // nvtxRangeEnd(rangeBS);
+
             nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
-            auto packed_baby = pack_baby_steps_all_hoisted_ntt(
-                *this, current_input_ct, g2, galois_key_bs,
-                modulus_->data(), ntt_table_->data(),
-                n_power, static_cast<int>(Q_size_), stream);
+            std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> baby_steps(g2);
+            baby_steps[0] = current_input_ct;
+            for (int j = 1; j < g2; ++j) {
+                rotate_rows_via_pow2(*this, current_input_ct, baby_steps[j], galois_key_bs, j, local_opt);
+                transform_to_ntt_inplace(baby_steps[j], local_opt);
+            }
+            transform_to_ntt_inplace(baby_steps[0], local_opt);
+
+            auto packed_baby = pack_baby_steps_all(
+                baby_steps, static_cast<int>(Q_size_), n_power, stream);
             nvtxRangeEnd(rangeBS);
+
 
             const auto& blob_plain = matrix_groups_caller[group_idx][0];
             const auto& shifts     = shifts_caller[group_idx];
