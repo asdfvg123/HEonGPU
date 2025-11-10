@@ -440,7 +440,7 @@ namespace heongpu
         auto y = operator_.multiply_matrix(x, 
                                           this->linear_matrix_diagonals_, 
                                           this->linear_matrix_shifts_, 
-                                          galois_key_, 
+                                          galois_key_hera_, 
                                           opt);
         output = y;
         HEONGPU_CUDA_CHECK(cudaGetLastError());

@@ -106,6 +106,7 @@ int main(int argc, char* argv[])
     std::cout << "Generating Galois keys for S2C_FV function..." << std::endl;
     const int N = static_cast<int>(poly_modulus_degree);
     const int g2 = static_cast<int>(std::ceil(std::sqrt((double)N/2)));
+
     const int H = static_cast<int>(N/2);
 
     std::set<int> required_shifts, bs_shifts;
@@ -134,11 +135,11 @@ int main(int argc, char* argv[])
         long long row_rotation_amount = effective_rot % N_div_2;
         if (row_rotation_amount != 0) required_shifts.insert(static_cast<int>(row_rotation_amount));
     }
-    for(auto v : required_shifts) {
-        std::cout << v << " ";
-    }
-    std::cout << std::endl;
-    std::cout << "Number of required Galois shifts: " << required_shifts.size() << std::endl;
+
+    std::vector<int> hera_shifts = {1, 2, 4, 8, -1, -2, -4, -8};
+    heongpu::Galoiskey<Scheme> galois_key_hera(context, hera_shifts);
+    keygen.generate_galois_key(galois_key_hera, secret_key);
+
     std::vector<int> all_required(required_shifts.begin(), required_shifts.end());
     std::vector<int> bs_required(bs_shifts.begin(), bs_shifts.end());
 
@@ -165,7 +166,9 @@ int main(int argc, char* argv[])
     heongpu::HEArithmeticOperator<Scheme> op(context, encoder);
     heongpu::HEHERA<Scheme> hera(context, contextckks, encoder, encryptor, op, galois_key, relin_key);
 
-    hera.set_galois_key_bs(galois_key_bs);
+
+
+    
 
 
     // =========================================================================
@@ -175,19 +178,35 @@ int main(int argc, char* argv[])
     for (int i = 0; i < N; ++i) message[i] = delta * (i % 16);
     print_first("(message)", message, 32);
 
+    std::vector<uint64_t> keyhera(poly_modulus_degree, 0ULL);
+    for (int i = 0; i < 16; ++i) keyhera[i] = static_cast<uint64_t>(i + 1);
+    for (int i = 16; i < 32; ++i) keyhera[i] = static_cast<uint64_t>(i + 1 - 16);
+
+    heongpu::Plaintext<Scheme> P_keyhera(context);
+    encoder.encode(P_keyhera, keyhera);
+    heongpu::Ciphertext<Scheme> C_keyhera(context);
+    encryptor.encrypt(C_keyhera, P_keyhera);
+
     heongpu::Plaintext<Scheme> pt_in(context);
     encoder.encode(pt_in, message);
     
     heongpu::Ciphertext<Scheme> ct_in(context);
-    encryptor.encrypt(ct_in, pt_in); // slot : [0, 1, 2, 3, ...], coeff : [bigInt, ...,]
- 
+    encryptor.encrypt(ct_in, pt_in); 
 
+    hera.set_galois_key_hera(galois_key_hera);
+    nvtxRangeId_t rangekey_gen = nvtxRangeStartA("stream key gen");
+    auto C_lin = hera.gen_stream_key(C_keyhera);
+    nvtxRangeEnd(rangekey_gen);
+    hera.reset_galois_key_(galois_key_hera); 
+    
+
+    hera.set_galois_key_bs(galois_key_bs);
     hera.gen_FV_S2C_Matrix();
-    cudaProfilerStart();
+    // cudaProfilerStart();
     auto ct_s2c = hera.S2C_FV(ct_in);
-    cudaProfilerStop();
+    // cudaProfilerStop();
+    hera.reset_galois_key_(galois_key_bs); 
 
-    hera.reset_galois_key_bs(galois_key_bs); 
 
     std::vector<uint64_t> message_client(N, 0ULL);
     for (int i = 0; i < N; ++i) message_client[i] = delta * ((i % 16) + (i % 4));

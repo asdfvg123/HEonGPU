@@ -1258,6 +1258,55 @@ namespace heongpu
             BFVKeySwitchHoistedMethodI& ws,
             const cudaStream_t stream);
 
+
+        static inline int floor_log2_u32(unsigned x) {
+        #if defined(__GNUC__)
+            return 31 - __builtin_clz(x);
+        #else
+            int p = -1; while (x) { x >>= 1; ++p; } return p;
+        #endif
+        }
+
+        static inline std::vector<int> decompose_pow2_positive(int s) {
+            std::vector<int> steps;
+            while (s) {
+                int p  = floor_log2_u32((unsigned)s);
+                int p2 = 1 << p;           
+                steps.push_back(p2);
+                s -= p2;
+            }
+            return steps;
+        }
+
+        static inline std::vector<int> decompose_pow2_signed(int s) {
+            std::vector<int> steps;
+            if (s == 0)
+                return steps;
+
+            if (s > 0) {
+                // 양수면 기존 로직 재사용
+                return decompose_pow2_positive(s);
+            }
+
+            // s < 0: -1, -2, -4, ... 조합으로 표현
+            unsigned v = (unsigned)(-s); // 절댓값
+            while (v) {
+                int p  = floor_log2_u32(v);
+                int p2 = 1 << p;
+                steps.push_back(-p2);    // -1, -2, -4, ...
+                v -= p2;
+            }
+            return steps;
+        }
+
+
+        __host__ void rotate_rows_via_pow2(
+            const heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
+            heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_out,
+            heongpu::Galoiskey<heongpu::Scheme::RTF>& gk,
+            int s,
+            const heongpu::ExecutionOptions& opt);
+
         __host__ heongpu::DeviceVector<Data64>
         pack_baby_steps_all_hoisted_chain(
             heongpu::HEOperator<heongpu::Scheme::RTF>& op,

@@ -684,7 +684,8 @@ namespace heongpu
                 heongpu::Ciphertext<heongpu::Scheme::RTF> rotated = ct;
                 if (rot != 0)
                 {
-                    rotate_rows_inplace(rotated, galois_key, rot, opt);
+                    // rotate_rows_inplace(rotated, galois_key, rot, opt);
+                    rotate_rows_via_pow2(ct, rotated, galois_key, rot, opt);
                 }
 
                 // Load this diagonal (coeff domain)
@@ -728,6 +729,131 @@ namespace heongpu
         }
         return acc_ntt;
     }
+
+// __host__ heongpu::Ciphertext<heongpu::Scheme::RTF>
+//     heongpu::HEOperator<heongpu::Scheme::RTF>::multiply_matrix(
+//         heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
+//         std::vector<heongpu::DeviceVector<Data64>>& matrix,   // [group] blob: concat diags (NTT/RNS)
+//         std::vector<std::vector<int>>& diags,                 // [group] rotation list (may be >= H)
+//         heongpu::Galoiskey<heongpu::Scheme::RTF>& galois_key,
+//         const ExecutionOptions& options)
+//     {
+//         cudaStream_t stream = options.stream_;
+//         if (stream == cudaStreamDefault)
+//             stream = cipher.stream();
+
+//         nvtx3::scoped_range data_processing_range("matmul_flat_rotate_nomask");
+
+//         ExecutionOptions opt = ExecutionOptions()
+//                                .set_stream(stream)
+//                                .set_storage_type(storage_type::DEVICE)
+//                                .set_initial_location(true);
+
+//         heongpu::Ciphertext<heongpu::Scheme::RTF> ct = cipher;
+
+//         // Work in coefficient domain for rotations
+//         if (ct.in_ntt_domain_) {
+//             transform_from_ntt_inplace(ct, opt);
+//         }
+//         if (ct.relinearization_required_) {
+//             throw std::invalid_argument("multiply_matrix: relinearize first.");
+//         }
+
+//         const int  N  = static_cast<int>(n);
+//         const int  H  = N >> 1;                  
+//         const int  Q  = static_cast<int>(Q_size_);
+//         // const size_t per_diag_len = static_cast<size_t>(N) * static_cast<size_t>(Q); // N * Q (NTT/RNS)
+//         const size_t per_diag_len = static_cast<size_t>(N);
+
+//         // Prepare two inputs once: original and column-swapped
+//         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig = ct;
+//         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
+//         rotate_columns(ct_orig, ct_swapped, galois_key, opt); // row swap (no conjugation)
+
+//         // Accumulator in NTT domain
+//         heongpu::Ciphertext<heongpu::Scheme::RTF> acc_ntt = operator_ciphertext(stream);
+//         bool acc_initialized = false;
+
+//         // Sanity: groups aligned
+//         if (matrix.size() != diags.size()) {
+//             throw std::invalid_argument("multiply_matrix: matrix.size() must match diags.size().");
+//         }
+
+//         // Loop groups
+//         for (size_t g = 0; g < diags.size(); ++g) {
+//             if (diags[g].empty()) continue;
+
+//             // Caller contract:
+//             //   g == 0 -> same-row pre-split diagonals for ct_orig
+//             //   g == 1 -> cross-row pre-split diagonals for ct_swapped
+//             // If more groups exist, they alternate: even->orig, odd->swapped.
+//             heongpu::Ciphertext<heongpu::Scheme::RTF>& current_input_ct =
+//                 ((g & 1) == 0) ? ct_orig : ct_swapped;
+
+//             auto& blob = matrix[g];
+//             const size_t num_diags = diags[g].size();
+
+//             if (blob.size() < num_diags * per_diag_len) {
+//                 throw std::invalid_argument("multiply_matrix: blob size < num_diags * per_diag_len.");
+//             }
+//             Data64* base_ptr = blob.data();
+
+//             for (size_t k = 0; k < num_diags; ++k) {
+//                 int t = diags[g][k];
+//                 // Normalize t into [0, N)
+//                 if (t < 0) {
+//                     t %= N;
+//                     if (t < 0) t += N;
+//                 } else if (t >= N) {
+//                     t %= N;
+//                 }
+//                 const int s = t % H;
+
+//                 heongpu::DeviceVector<Data64> diag_ntt(per_diag_len, stream);
+// 	                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+//                     diag_ntt.data(),
+//                     base_ptr + k * per_diag_len,
+//                     per_diag_len * sizeof(Data64),
+//                     cudaMemcpyDeviceToDevice,
+//                     stream));
+
+//                 heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag;
+//                 pt_diag.memory_set(std::move(diag_ntt));
+//                 transform_to_ntt_inplace(pt_diag, opt);
+
+//                 // pt_diag.scheme_              = scheme_;
+//                 // pt_diag.plain_size_          = N;
+//                 // pt_diag.in_ntt_domain_       = true;   // diagonal buffer is already in NTT/RNS
+//                 // pt_diag.plaintext_generated_ = true;
+
+//                 // Rotate rows by s on the selected input (coeff domain)
+//                 heongpu::Ciphertext<heongpu::Scheme::RTF> term = current_input_ct;
+//                 if (s != 0) {
+//                     rotate_rows_inplace(term, galois_key, s, opt); // left shift within rows
+//                 }
+
+//                 // NTT, pointwise multiply by this pre-split diagonal, accumulate
+//                 transform_to_ntt_inplace(term, opt);
+//                 multiply_plain_inplace(term, pt_diag, opt);
+
+//                 if (!acc_initialized) {
+//                     acc_ntt = term;
+//                     acc_initialized = true;
+//                 } else {
+//                     add_inplace(acc_ntt, term, opt);
+//                 }
+//             }
+//         }
+
+//         if (acc_initialized) {
+//             transform_from_ntt_inplace(acc_ntt, opt);
+//             return acc_ntt;
+//         }
+
+//         // No diagonals -> return zero ciphertext on the same stream
+//         heongpu::Ciphertext<heongpu::Scheme::RTF> zero_ct = operator_ciphertext(stream);
+//         return zero_ct;
+//     }
 
     // Helper inside HEOperator<Scheme::RTF> (or a free function with access to n, Q_size_, tables)
     __host__ heongpu::DeviceVector<Data64>
@@ -1269,27 +1395,7 @@ namespace heongpu
     }
 
 
-    static inline int floor_log2_u32(unsigned x) {
-    #if defined(__GNUC__)
-        return 31 - __builtin_clz(x);
-    #else
-        int p = -1; while (x) { x >>= 1; ++p; } return p;
-    #endif
-    }
-
-    static inline std::vector<int> decompose_pow2_positive(int s) {
-        std::vector<int> steps;
-        while (s) {
-            int p  = floor_log2_u32((unsigned)s);
-            int p2 = 1 << p;           
-            steps.push_back(p2);
-            s -= p2;
-        }
-        return steps;
-    }
-
-    void rotate_rows_via_pow2(
-        heongpu::HEOperator<heongpu::Scheme::RTF>& op,
+    void heongpu::HEOperator<heongpu::Scheme::RTF>::rotate_rows_via_pow2(
         const heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
         heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_out,
         heongpu::Galoiskey<heongpu::Scheme::RTF>& gk,
@@ -1297,17 +1403,20 @@ namespace heongpu
         const heongpu::ExecutionOptions& opt)
     {
         if (s == 0) { ct_out = ct_in; return; }
-        std::vector<int> steps = decompose_pow2_positive(s);
+        
+        std::vector<int> steps = decompose_pow2_signed(s);
 
         heongpu::Ciphertext<heongpu::Scheme::RTF> a = ct_in, b;
         bool use_a_as_in = true;
         for (size_t i = 0; i < steps.size(); ++i) {
             auto& in  = use_a_as_in ? a : b;
             auto& out = use_a_as_in ? b : a;
-            op.rotate_rows(in, out, gk, steps[i], opt);
+            rotate_rows(in, out, gk, steps[i], opt);
             use_a_as_in = !use_a_as_in;
         }
         ct_out = use_a_as_in ? a : b; // 마지막으로 쓴 쪽을 반환
+        return;
+
     }
 
     __host__ heongpu::DeviceVector<Data64>
@@ -1385,7 +1494,6 @@ namespace heongpu
                 // rotate_rows_via_pow2:
                 //   dst = Rot^{step}(src)
                 rotate_rows_via_pow2(
-                    *this,
                     src,
                     dst,
                     galois_key_bs,
@@ -1501,6 +1609,7 @@ namespace heongpu
         const int    N  = static_cast<int>(n);
         const int    H  = N >> 1;
         const int    g2 = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(H))));
+
         const size_t Q  = static_cast<size_t>(Q_size_);
 
         heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig   = input;
