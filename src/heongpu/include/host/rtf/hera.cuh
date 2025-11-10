@@ -56,20 +56,20 @@ namespace heongpu
         };
 
 
-        __host__ void reset_galois_key_(Galoiskey<Scheme::RTF>& galois_key)
-        {
-            galois_key.device_location_.clear();
+        // __host__ void reset_galois_key_(Galoiskey<Scheme::RTF>& galois_key)
+        // {
+        //     galois_key.device_location_.clear();
 
-            galois_key.host_location_.clear();
-            galois_key.zero_device_location_ =
-                decltype(galois_key.zero_device_location_)();
-            galois_key.zero_host_location_.clear();
+        //     galois_key.host_location_.clear();
+        //     galois_key.zero_device_location_ =
+        //         decltype(galois_key.zero_device_location_)();
+        //     galois_key.zero_host_location_.clear();
 
-            galois_key.galoiskey_size_ = 0;
-            galois_key.galois_key_generated_ = false;
+        //     galois_key.galoiskey_size_ = 0;
+        //     galois_key.galois_key_generated_ = false;
 
-            galois_key.storage_type_ = storage_type::HOST;
-        }
+        //     galois_key.storage_type_ = storage_type::HOST;
+        // }
 
 
         HEHERA() = default;

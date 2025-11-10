@@ -692,6 +692,29 @@ namespace heongpu
                 throw std::runtime_error("prefetch_many_async: cudaEventRecord failed");
             }
         }
+        __host__ void reset()
+        {
+            // Clear data containers for row rotations
+            device_location_.clear();
+            host_location_.clear();
+
+            // Clear data containers for column rotation
+            // Re-assigning to a default-constructed object is a guaranteed
+            // way to free the underlying device memory.
+            zero_device_location_ = DeviceVector<Data64>();
+            zero_host_location_.clear(); // .clear() is fine for std::vector
+
+            // --- These were missing from your original function ---
+            // Clear the metadata associated with the keys
+            galois_elt.clear();
+            custom_galois_elt.clear();
+            galois_elt_zero = 0; // Assuming 0 is a safe default
+
+            // Reset key state metadata
+            galoiskey_size_ = 0;
+            galois_key_generated_ = false;
+            storage_type_ = storage_type::HOST; // Reset to default storage
+        }
 
         
       private:

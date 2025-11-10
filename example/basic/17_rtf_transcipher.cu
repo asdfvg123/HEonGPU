@@ -197,7 +197,8 @@ int main(int argc, char* argv[])
     nvtxRangeId_t rangekey_gen = nvtxRangeStartA("stream key gen");
     auto C_lin = hera.gen_stream_key(C_keyhera);
     nvtxRangeEnd(rangekey_gen);
-    hera.reset_galois_key_(galois_key_hera); 
+    // hera.reset_galois_key_(galois_key_hera); 
+    galois_key_hera.reset();
     
 
     hera.set_galois_key_bs(galois_key_bs);
@@ -205,7 +206,8 @@ int main(int argc, char* argv[])
     // cudaProfilerStart();
     auto ct_s2c = hera.S2C_FV(ct_in);
     // cudaProfilerStop();
-    hera.reset_galois_key_(galois_key_bs); 
+    // hera.reset_galois_key_(galois_key_bs); 
+    galois_key_bs.reset();
 
 
     std::vector<uint64_t> message_client(N, 0ULL);
