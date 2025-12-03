@@ -136,7 +136,7 @@ int main(int argc, char* argv[])
         if (row_rotation_amount != 0) required_shifts.insert(static_cast<int>(row_rotation_amount));
     }
 
-    std::vector<int> hera_shifts = {1, 2, 4, 8, -1, -2, -4, -8};
+    std::vector<int> hera_shifts = {1, 2, 4, 8, 16, 32, -1, -2, -4, -8, -16, -32};
     heongpu::Galoiskey<Scheme> galois_key_hera(context, hera_shifts);
     keygen.generate_galois_key(galois_key_hera, secret_key);
 

@@ -18,7 +18,7 @@ int main(int argc, char* argv[])
 
     // --- Context / params ---
     heongpu::HEContext<Scheme> context(
-        heongpu::keyswitching_type::KEYSWITCHING_METHOD_II);
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
 
 
 

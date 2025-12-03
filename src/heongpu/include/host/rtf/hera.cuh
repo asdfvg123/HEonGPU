@@ -479,7 +479,7 @@ namespace heongpu
         Data64 plain_inv_psi;
 
         // hera
-        int round_ = 5;
+        int round_ = 2;
         size_t rc_vec_size_ = 0;
 
         std::vector<heongpu::DeviceVector<Data64>> linear_matrix_diagonals_;
