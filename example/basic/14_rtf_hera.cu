@@ -18,15 +18,18 @@ int main(int argc, char* argv[])
 
     // --- Context / params ---
     heongpu::HEContext<Scheme> context(
-        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I, 
+        heongpu::sec_level_type::none);
 
-
-
-    size_t poly_modulus_degree = 65536; // divisible by 16
+    size_t poly_modulus_degree = 4096; // divisible by 16
     context.set_poly_modulus_degree(poly_modulus_degree);
-
-    context.set_coeff_modulus_default_values(1);
-
+    std::vector<int> logQ = {
+        60, 50, 50, 50, 50, 
+        50, 50, 50, 50, 50};
+    std::vector<int> logP = {60}; 
+    context.set_coeff_modulus_bit_sizes(logQ, logP);
+    // context.set_coeff_modulus_default_values(1);
+ 
     // int plain_modulus = 786433; // prime t
     int plain_modulus = 0x1fc0001ULL;
 
@@ -36,10 +39,11 @@ int main(int argc, char* argv[])
     context.print_parameters();
 
     heongpu::HEContext<SchemeCKKS> contextckks(
-        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
+        heongpu::keyswitching_type::KEYSWITCHING_METHOD_I, 
+        heongpu::sec_level_type::none);
     contextckks.set_poly_modulus_degree(poly_modulus_degree);
-    contextckks.set_coeff_modulus_bit_sizes({60, 30, 30, 30}, {60});
-    contextckks.generate();
+    contextckks.set_coeff_modulus_bit_sizes(logQ, logP);
+    contextckks.generate(); 
 
     heongpu::HEKeyGenerator<Scheme> keygen(context);
     heongpu::Secretkey<Scheme> secret_key(context);
@@ -58,11 +62,12 @@ int main(int argc, char* argv[])
         // Alternative way 1 -> calculate dedicated shift value:
     // const int row_len = static_cast<int>(poly_modulus_degree) >> 1; // 2048
 
-    std::vector<int> shifts = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-                         -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13, -14, -15}; // example
+    std::vector<int> shifts = {1, 2, 4, 8, 16, 32, -1, -2, -4, -8, -16, -32};
     // example heongpu::Galoiskey galois_key(context, shifts);
+    heongpu::ExecutionOptions opt_device;
+    opt_device.set_storage_type(heongpu::storage_type::DEVICE);
     heongpu::Galoiskey<Scheme> galois_key(context, shifts);
-    keygen.generate_galois_key(galois_key, secret_key);
+    keygen.generate_galois_key(galois_key, secret_key, opt_device);
 
     
     // Alternative way 1 -> calculate dedicated shift value:
@@ -83,17 +88,16 @@ int main(int argc, char* argv[])
     heongpu::HEDecryptor<Scheme> decryptor(context, secret_key);
     heongpu::HEArithmeticOperator<Scheme> operators(context, encoder);
 
-    // --- Test message: first 16 slots = 1..16, others 0 ---
     std::vector<uint64_t> message(poly_modulus_degree, 0ULL);
-    for (int i = 0; i < 16; ++i) message[i] = static_cast<uint64_t>(i + 1);
-    for (int i = 16; i < 32; ++i) message[i] = static_cast<uint64_t>(i + 1 - 16);
+    for (int i = 0; i < 64; ++i) message[i] = static_cast<uint64_t>(i + 1);
+    for (int i = 64; i < 128; ++i) message[i] = static_cast<uint64_t>(i + 1 - 64);
 
     std::vector<uint64_t> keyhera(poly_modulus_degree, 0ULL);
-    for (int i = 0; i < 16; ++i) keyhera[i] = static_cast<uint64_t>(i + 1);
-    for (int i = 16; i < 32; ++i) keyhera[i] = static_cast<uint64_t>(i + 1 - 16);
+    for (int i = 0; i < 64; ++i) keyhera[i] = static_cast<uint64_t>(i + 1);
+    for (int i = 64; i < 128; ++i) keyhera[i] = static_cast<uint64_t>(i + 1 - 64);
 
-    std::cout << "[Input] First 64 entries:\n";
-    for(int i = 0; i < 64; ++i) {
+    std::cout << "[Input] First 128 entries:\n";
+    for(int i = 0; i < 128; ++i) {
         std::cout << message[i] << " ";
         if (i % 16 == 15) std::cout << "\n";
     }
@@ -113,7 +117,7 @@ int main(int argc, char* argv[])
     heongpu::HEHERA<Scheme> hera(
         context, contextckks, encoder, encryptor, operators, galois_key, relin_key);
     
-   
+    hera.set_galois_key_hera(galois_key);
     auto icCt_ = hera.get_icCt();
     heongpu::Plaintext<Scheme> P_ic(context);
     decryptor.decrypt(P_ic, icCt_);
@@ -149,7 +153,7 @@ int main(int argc, char* argv[])
     encoder.decode(vec_lin, P_lin);
 
     std::cout << "\n[Output after linear()] First 64 entries:\n";
-    for(int i = 0; i < 128; ++i) {
+    for(int i = 0; i < 256; ++i) {
         std::cout << vec_lin[i] << " ";
         if (i % 16 == 15) std::cout << "\n";
     }

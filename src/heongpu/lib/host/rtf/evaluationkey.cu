@@ -367,6 +367,7 @@ namespace heongpu
         {
             throw std::invalid_argument("HEContext is not generated!");
         }
+        std::cout << "galois key constructor: " << static_cast<int>(context.keyswitching_type_) << std::endl;
 
         scheme_ = context.scheme_;
         key_type = context.keyswitching_type_;
