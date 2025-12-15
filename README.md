@@ -9,14 +9,13 @@ For more information about RtF:
 
 ### Execution times of the RtF flow
 
-| HHE Scheme             | logN | logl | r | logQP | logDelta_CKKS | Offline Latency | Online Latency  | Throughput  |
-|:----------------------:|:----:|:----:|:-:|:-----:|:-------------:|:---------------:|:---------------:|:-----------:|
-| **HERA Par-128**       | 16   | 16   | 5 | 1533  | 50            |                 |                 |             |
-| **Rubato Par-128S**    | 16   | 12   | 5 | 1533  | 50            |                 |                 |             |
-| **Rubato Par-128L**    | 16   | 60   | 2 | 1533  | 50            |                 |                 |             |
+| HHE Scheme             | logN | l | r | logQP | logDelta_CKKS | Offline Latency [s] | Online Latency [ms]  | Throughput [KB/s]  |
+|:----------------------:|:----:|:-:|:-:|:-----:|:-------------:|:---------------:|:---------------:|:-----------:|
+| **HERA Par-128**       | 16   | 16| 5 | 1533  | 50            |    11.2         |   485              |   17.1          |
+| **Rubato Par-128L**    | 16   | 60| 2 | 1533  | 50            |    13.7         |   491              |   14.1          |
 
 </div>
-All experiments are conducted with A100. 
+All experiments are conducted with H100. 
 
 
 
