@@ -6,6 +6,10 @@
 #ifndef HEONGPU_CKKS_OPERATOR_H
 #define HEONGPU_CKKS_OPERATOR_H
 
+#include <vector>
+#include <cstdint>
+#include <cstdlib>
+#include <cmath>
 #include "ntt.cuh"
 #include "fft.cuh"
 #include "addition.cuh"
@@ -229,6 +233,86 @@ namespace heongpu
                 options, true);
         }
 
+        //
+
+        /**
+         * @brief Adds a ciphertext and a plaintext and stores the result in the
+         * output.
+         *
+         * @param input1 Input ciphertext to be added.
+         * @param input2 Input constant plaintext(double) to be added.
+         * @param output Ciphertext where the result of the addition is stored.
+         */
+        __host__ void
+        add_plain(Ciphertext<Scheme::CKKS>& input1, double input2,
+                  Ciphertext<Scheme::CKKS>& output,
+                  const ExecutionOptions& options = ExecutionOptions())
+        {
+            if (input1.relinearization_required_)
+            {
+                throw std::invalid_argument(
+                    "Ciphertext and Plaintext can not be added because "
+                    "ciphertext has non-linear partl!");
+            }
+
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            add_constant_plain_ckks(input1_,
+                                                    input2 * input1_.scale_,
+                                                    output_, options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ = 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.scale_ = input1_.scale_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
+        }
+
+        /**
+         * @brief Adds a plaintext to a ciphertext in-place, modifying the input
+         * ciphertext.
+         *
+         * @param input1 Ciphertext to which the plaintext will be added.
+         * @param input2 Input constant plaintext(double) to be added.
+         */
+        __host__ void
+        add_plain_inplace(Ciphertext<Scheme::CKKS>& input1, double input2,
+                          const ExecutionOptions& options = ExecutionOptions())
+        {
+            if (input1.relinearization_required_)
+            {
+                throw std::invalid_argument(
+                    "Ciphertext and Plaintext can not be added because "
+                    "ciphertext has non-linear partl!");
+            }
+
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    add_constant_plain_ckks_inplace(
+                        input1_, input2 * input1_.scale_, options.stream_);
+                },
+                options, true);
+        }
+
         /**
          * @brief Subtracts a plaintext from a ciphertext and stores the result
          * in the output.
@@ -329,6 +413,128 @@ namespace heongpu
                         options, false);
                 },
                 options, true);
+        }
+
+        /**
+         * @brief Subtracts a plaintext from a ciphertext and stores the result
+         * in the output.
+         *
+         * @param input1 Input ciphertext (minuend).
+         * @param input2 Input plaintext (subtrahend).
+         * @param output Ciphertext where the result of the subtraction is
+         * stored.
+         */
+        __host__ void
+        sub_plain(Ciphertext<Scheme::CKKS>& input1, double input2,
+                  Ciphertext<Scheme::CKKS>& output,
+                  const ExecutionOptions& options = ExecutionOptions())
+        {
+            if (input1.relinearization_required_)
+            {
+                throw std::invalid_argument(
+                    "Ciphertext and Plaintext can not be added because "
+                    "ciphertext has non-linear partl!");
+            }
+
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            sub_constant_plain_ckks(input1_,
+                                                    input2 * input1_.scale_,
+                                                    output_, options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ = 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.scale_ = input1_.scale_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
+        }
+
+        /**
+         * @brief Subtracts a plaintext from a ciphertext in-place, modifying
+         * the input ciphertext.
+         *
+         * @param input1 Ciphertext from which the plaintext will be subtracted.
+         * @param input2 Plaintext to be subtracted from the ciphertext.
+         */
+        __host__ void
+        sub_plain_inplace(Ciphertext<Scheme::CKKS>& input1, double input2,
+                          const ExecutionOptions& options = ExecutionOptions())
+        {
+            if (input1.relinearization_required_)
+            {
+                throw std::invalid_argument(
+                    "Ciphertext and Plaintext can not be added because "
+                    "ciphertext has non-linear partl!");
+            }
+
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    sub_constant_plain_ckks_inplace(
+                        input1_, input2 * input1_.scale_, options.stream_);
+                },
+                options, true);
+        }
+
+        /**
+         * @brief Adds a complex constant to a ciphertext and stores the result
+         * in the output (v2 version).
+         *
+         * @param input1 Input ciphertext to be added.
+         * @param c Complex constant to be added (not multiplied by scale).
+         * @param output Ciphertext where the result of the addition is stored.
+         */
+        __host__ void
+        add_plain_v2(Ciphertext<Scheme::CKKS>& input1, Complex64 c,
+                     Ciphertext<Scheme::CKKS>& output,
+                     const ExecutionOptions& options = ExecutionOptions())
+        {
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            add_constant_plain_ckks_v2(input1_, c, output_,
+                                                       options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ =
+                                input1_.relinearization_required_ ? 3 : 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.scale_ = input1_.scale_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
         }
 
         /**
@@ -496,6 +702,244 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions())
         {
             multiply_plain(input1, input2, input1, options);
+        }
+
+        /**
+         * @brief Multiplies a ciphertext and a plaintext and stores the result
+         * in the output.
+         *
+         * @param input1 Input ciphertext to be multiplied.
+         * @param input2 Input constant plaintext(double) to be multiplied.
+         * @param output Ciphertext where the result of the multiplication is
+         * stored.
+         */
+        __host__ void
+        multiply_plain(Ciphertext<Scheme::CKKS>& input1, double input2,
+                       Ciphertext<Scheme::CKKS>& output, double scale,
+                       const ExecutionOptions& options = ExecutionOptions())
+        {
+            if (input1.relinearization_required_)
+            {
+                throw std::invalid_argument(
+                    "Ciphertext and Plaintext can not be multiplied because of "
+                    "the non-linear part! Please use relinearization "
+                    "operation!");
+            }
+
+            int current_decomp_count = Q_size_ - input1.depth_;
+
+            if (input1.memory_size() < (2 * n * current_decomp_count))
+            {
+                throw std::invalid_argument("Invalid Ciphertexts size!");
+            }
+
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            multiply_const_plain_ckks(input1_, input2, output_,
+                                                      scale, options.stream_);
+                            output_.rescale_required_ = true;
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ = 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
+        }
+
+        /**
+         * @brief Multiplies a plaintext with a ciphertext in-place, modifying
+         * the input ciphertext.
+         *
+         * @param input1 Ciphertext to be multiplied by the plaintext, and where
+         * the result will be stored.
+         * @param input2 Input constant plaintext(double) to be multiplied.
+         */
+        __host__ void multiply_plain_inplace(
+            Ciphertext<Scheme::CKKS>& input1, double input2, double scale,
+            const ExecutionOptions& options = ExecutionOptions())
+        {
+            multiply_plain(input1, input2, input1, scale, options);
+        }
+
+        /**
+         * @brief Multiplies a ciphertext by a complex constant and stores the
+         * result in the output (v2 version).
+         *
+         * @param input1 Input ciphertext to be multiplied.
+         * @param c Complex constant to multiply with the ciphertext.
+         * @param output Ciphertext where the result of the multiplication is
+         * stored.
+         */
+        __host__ void
+        multiply_plain_v2(Ciphertext<Scheme::CKKS>& input1, Complex64 c,
+                          Ciphertext<Scheme::CKKS>& output,
+                          const ExecutionOptions& options = ExecutionOptions())
+        {
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            multiply_const_plain_ckks_v2(input1_, c, output_,
+                                                         options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ =
+                                input1_.relinearization_required_ ? 3 : 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
+        }
+
+        /**
+         * @brief Scales up a ciphertext by multiplying its scale factor.
+         *
+         * @param input Input ciphertext to be scaled up.
+         * @param scale Scaling factor to multiply with the ciphertext's current
+         * scale.
+         * @param output Ciphertext where the scaled result is stored.
+         */
+        __host__ void
+        scale_up(Ciphertext<Scheme::CKKS>& input, double scale,
+                 Ciphertext<Scheme::CKKS>& output,
+                 const ExecutionOptions& options = ExecutionOptions())
+        {
+            input_storage_manager(
+                input,
+                [&](Ciphertext<Scheme::CKKS>& input_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            scale_up_ckks(input_, scale, output_,
+                                          options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ =
+                                input_.relinearization_required_ ? 3 : 2;
+                            output_.depth_ = input_.depth_;
+                            output_.in_ntt_domain_ = input_.in_ntt_domain_;
+                            output_.rescale_required_ =
+                                input_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input == &output));
+        }
+
+        /**
+         * @brief Multiplies a ciphertext by the imaginary unit i and stores the
+         * result in the output.
+         *
+         * @param input1 Input ciphertext to be multiplied by i.
+         * @param output Ciphertext where the result is stored.
+         */
+        __host__ void
+        mult_i(Ciphertext<Scheme::CKKS>& input1,
+               Ciphertext<Scheme::CKKS>& output,
+               const ExecutionOptions& options = ExecutionOptions())
+        {
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            mult_i_ckks(input1_, output_, options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ =
+                                input1_.relinearization_required_ ? 3 : 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.scale_ = input1_.scale_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
+        }
+
+        /**
+         * @brief Divides a ciphertext by the imaginary unit i and stores the
+         * result in the output.
+         *
+         * @param input1 Input ciphertext to be divided by i.
+         * @param output Ciphertext where the result is stored.
+         */
+        __host__ void
+        div_i(Ciphertext<Scheme::CKKS>& input1,
+              Ciphertext<Scheme::CKKS>& output,
+              const ExecutionOptions& options = ExecutionOptions())
+        {
+            input_storage_manager(
+                input1,
+                [&](Ciphertext<Scheme::CKKS>& input1_)
+                {
+                    output_storage_manager(
+                        output,
+                        [&](Ciphertext<Scheme::CKKS>& output_)
+                        {
+                            div_i_ckks(input1_, output_, options.stream_);
+
+                            output_.scheme_ = scheme_;
+                            output_.ring_size_ = n;
+                            output_.coeff_modulus_count_ = Q_size_;
+                            output_.cipher_size_ =
+                                input1_.relinearization_required_ ? 3 : 2;
+                            output_.depth_ = input1_.depth_;
+                            output_.in_ntt_domain_ = input1_.in_ntt_domain_;
+                            output_.scale_ = input1_.scale_;
+                            output_.rescale_required_ =
+                                input1_.rescale_required_;
+                            output_.relinearization_required_ =
+                                input1_.relinearization_required_;
+                            output_.ciphertext_generated_ = true;
+                        },
+                        options);
+                },
+                options, (&input1 == &output));
         }
 
         /**
@@ -1112,6 +1556,16 @@ namespace heongpu
                                              Plaintext<Scheme::CKKS>& input2,
                                              const cudaStream_t stream);
 
+        __host__ void add_constant_plain_ckks(Ciphertext<Scheme::CKKS>& input1,
+                                              double input2,
+                                              Ciphertext<Scheme::CKKS>& output,
+                                              const cudaStream_t stream);
+
+        __host__ void
+        add_constant_plain_ckks_inplace(Ciphertext<Scheme::CKKS>& input1,
+                                        double input2,
+                                        const cudaStream_t stream);
+
         __host__ void sub_plain_ckks(Ciphertext<Scheme::CKKS>& input1,
                                      Plaintext<Scheme::CKKS>& input2,
                                      Ciphertext<Scheme::CKKS>& output,
@@ -1120,6 +1574,37 @@ namespace heongpu
         __host__ void sub_plain_ckks_inplace(Ciphertext<Scheme::CKKS>& input1,
                                              Plaintext<Scheme::CKKS>& input2,
                                              const cudaStream_t stream);
+
+        __host__ void sub_constant_plain_ckks(Ciphertext<Scheme::CKKS>& input1,
+                                              double input2,
+                                              Ciphertext<Scheme::CKKS>& output,
+                                              const cudaStream_t stream);
+
+        __host__ void
+        sub_constant_plain_ckks_inplace(Ciphertext<Scheme::CKKS>& input1,
+                                        double input2,
+                                        const cudaStream_t stream);
+
+        __host__ void add_constant_plain_ckks_v2(
+            Ciphertext<Scheme::CKKS>& input1, Complex64 c,
+            Ciphertext<Scheme::CKKS>& output, const cudaStream_t stream);
+
+        __host__ void multiply_const_plain_ckks_v2(
+            Ciphertext<Scheme::CKKS>& input1, Complex64 c,
+            Ciphertext<Scheme::CKKS>& output, const cudaStream_t stream);
+
+        __host__ void scale_up_ckks(Ciphertext<Scheme::CKKS>& input,
+                                    double scale,
+                                    Ciphertext<Scheme::CKKS>& output,
+                                    const cudaStream_t stream);
+
+        __host__ void mult_i_ckks(Ciphertext<Scheme::CKKS>& input1,
+                                  Ciphertext<Scheme::CKKS>& output,
+                                  const cudaStream_t stream);
+
+        __host__ void div_i_ckks(Ciphertext<Scheme::CKKS>& input1,
+                                 Ciphertext<Scheme::CKKS>& output,
+                                 const cudaStream_t stream);
 
         __host__ void multiply_ckks(Ciphertext<Scheme::CKKS>& input1,
                                     Ciphertext<Scheme::CKKS>& input2,
@@ -1130,6 +1615,12 @@ namespace heongpu
                                           Plaintext<Scheme::CKKS>& input2,
                                           Ciphertext<Scheme::CKKS>& output,
                                           const cudaStream_t stream);
+
+        __host__ void
+        multiply_const_plain_ckks(Ciphertext<Scheme::CKKS>& input1,
+                                  double input2,
+                                  Ciphertext<Scheme::CKKS>& output,
+                                  double scale, const cudaStream_t stream);
 
         ///////////////////////////////////////////////////
 
@@ -1313,6 +1804,9 @@ namespace heongpu
         operator_from_ciphertext(Ciphertext<Scheme::CKKS>& input,
                                  cudaStream_t stream = cudaStreamDefault);
 
+        __host__ std::vector<int> rotation_index_generator(uint64_t n, int K,
+                                                           int M);
+
         class Vandermonde
         {
             template <Scheme S> friend class HEOperator;
@@ -1323,6 +1817,13 @@ namespace heongpu
             __host__ Vandermonde(const int poly_degree, const int CtoS_piece,
                                  const int StoC_piece,
                                  const bool less_key_mode);
+
+            __host__ Vandermonde(const int poly_degree, const int CtoS_piece,
+                                 const int StoC_piece,
+                                 const double CtoS_Scaling,
+                                 const double StoC_Scaling,
+                                 const float CtoS_bsgs_ratio,
+                                 const float StoC_bsgs_ratio);
 
             __host__ void generate_E_diagonals_index();
 
@@ -1338,11 +1839,20 @@ namespace heongpu
 
             __host__ void generate_V_n_lists();
 
+            __host__ void generate_V_n_lists_v2(float CtoS_bsgs_ratio,
+                                                float StoC_bsgs_ratio);
+
             __host__ void generate_pre_comp_V();
 
             __host__ void generate_pre_comp_V_inv();
 
+            __host__ void generate_pre_comp_V_v2();
+
+            __host__ void generate_pre_comp_V_inv_v2();
+
             __host__ void generate_key_indexs(const bool less_key_mode);
+
+            __host__ void generate_key_indexs_v2();
 
             Vandermonde() = delete;
 
@@ -1353,6 +1863,9 @@ namespace heongpu
 
             int CtoS_piece_;
             int StoC_piece_;
+
+            double CtoS_Scaling_;
+            double StoC_Scaling_;
 
             std::vector<int> E_size_;
             std::vector<int> E_inv_size_;
@@ -1394,7 +1907,50 @@ namespace heongpu
             std::vector<std::vector<std::vector<int>>> real_shift_n2_bsgs_;
             std::vector<std::vector<std::vector<int>>> real_shift_n2_inv_bsgs_;
 
+            std::vector<std::vector<int>> diags_matrices_bsgs_rot_n1_;
+            std::vector<std::vector<int>> diags_matrices_bsgs_rot_n2_;
+
+            std::vector<std::vector<int>> diags_matrices_inv_bsgs_rot_n1_;
+            std::vector<std::vector<int>> diags_matrices_inv_bsgs_rot_n2_;
+
             std::vector<int> key_indexs_;
+        };
+
+        class Polynomial
+        {
+            template <Scheme S> friend class HEOperator;
+            template <Scheme S> friend class HEArithmeticOperator;
+
+          public:
+            __host__ Polynomial()
+                : max_deg_(0), lead_(false), type_(PolyType::CHEBYSHEV),
+                  a_(0.0), b_(0.0)
+            {
+            }
+
+            // type: POLY_TYPE::MONOMIAL or POLY_TYPE::CHEBYSHEV
+            __host__ Polynomial(int max_deg,
+                                const std::vector<Complex64>& coeffs,
+                                bool lead = false,
+                                PolyType type = PolyType::CHEBYSHEV,
+                                double a = 0.0, double b = 0.0);
+
+            // Get degree of polynomial (number of coefficients - 1)
+            __host__ int degree() const;
+
+            // Get depth (ceil(log2(degree)))
+            __host__ int depth() const;
+
+            // Split polynomial coefficients for BSGS recursion
+            // Returns pair<poly_q, poly_r>
+            __host__ std::pair<Polynomial, Polynomial>
+            split_coeffs(int split) const;
+
+            PolyType type_;
+            int max_deg_;
+            std::vector<Complex64> coeffs_;
+            bool lead_;
+            double a_, b_;
         };
 
         double scale_boot_;
@@ -1404,8 +1960,26 @@ namespace heongpu
         int StoC_piece_;
         int taylor_number_;
         bool less_key_mode_;
+        int CtoS_level_;
+        int StoC_level_;
+
+        EncodingMatrixConfig cts_config_;
+        EncodingMatrixConfig stc_config_;
+        EvalModConfig eval_mod_config_;
+
+        Polynomial sine_poly_;
+        // Odd Taylor series of q_diff * arcsin(x) / (2 pi) (monomial basis),
+        // used by eval_mod when eval_mod_config_.arcsine_deg_ > 0.
+        Polynomial arcsine_poly_;
+
+        // Output scale of regular_halfbootstrapping_v2 (the scale label of the
+        // two returned ciphertexts). Independent of the EvalMod scaling factor
+        // and of the CoeffToSlot encoding scale (the CtS primes).
+        double halfboot_output_scale_ = 0.0;
 
         std::vector<int> key_indexs_;
+        // Rotation steps needed by CoeffToSlot only (HalfBoot v2).
+        std::vector<int> halfboot_key_indexs_;
 
         std::vector<heongpu::DeviceVector<Data64>> V_matrixs_rotated_encoded_;
         std::vector<heongpu::DeviceVector<Data64>>
@@ -1420,6 +1994,12 @@ namespace heongpu
         std::vector<std::vector<std::vector<int>>> real_shift_n2_bsgs_;
         std::vector<std::vector<std::vector<int>>> real_shift_n2_inv_bsgs_;
 
+        std::vector<std::vector<int>> diags_matrices_bsgs_rot_n1_;
+        std::vector<std::vector<int>> diags_matrices_inv_bsgs_rot_n1_;
+
+        std::vector<std::vector<int>> diags_matrices_bsgs_rot_n2_;
+        std::vector<std::vector<int>> diags_matrices_inv_bsgs_rot_n2_;
+
         ///////// Operator Class Encode Fuctions //////////
 
         int slot_count_;
@@ -1430,33 +2010,39 @@ namespace heongpu
         std::shared_ptr<DeviceVector<int>> reverse_order_;
         std::shared_ptr<DeviceVector<Complex64>> special_ifft_roots_table_;
 
-        __host__ void
-        quick_ckks_encoder_vec_complex(Complex64* input, Data64* output,
-                                       const double scale,
-                                       bool use_all_bases = false);
+        __host__ void quick_ckks_encoder_vec_complex(Complex64* input,
+                                                     Data64* output,
+                                                     const double scale,
+                                                     int rns_count);
 
-        __host__ void
-        quick_ckks_encoder_constant_complex(Complex64 input, Data64* output,
-                                            const double scale,
-                                            bool use_all_bases = false);
+        __host__ void quick_ckks_encoder_constant_complex(Complex64 input,
+                                                          Data64* output,
+                                                          const double scale);
 
-        __host__ void
-        quick_ckks_encoder_constant_double(double input, Data64* output,
-                                           const double scale,
-                                           bool use_all_bases = false);
+        __host__ void quick_ckks_encoder_constant_double(double input,
+                                                         Data64* output,
+                                                         const double scale);
 
-        __host__ void
-        quick_ckks_encoder_constant_integer(std::int64_t input, Data64* output,
-                                            const double scale,
-                                            bool use_all_bases = false);
+        __host__ void quick_ckks_encoder_constant_integer(std::int64_t input,
+                                                          Data64* output,
+                                                          const double scale);
 
         __host__ std::vector<heongpu::DeviceVector<Data64>>
         encode_V_matrixs(Vandermonde& vandermonde, const double scale,
-                         bool use_all_bases = false);
+                         int rns_count);
 
         __host__ std::vector<heongpu::DeviceVector<Data64>>
         encode_V_inv_matrixs(Vandermonde& vandermonde, const double scale,
-                             bool use_all_bases = false);
+                             int rns_count);
+
+        __host__ std::vector<heongpu::DeviceVector<Data64>>
+        encode_V_matrixs_v2(Vandermonde& vandermonde, int start_level);
+
+        __host__ std::vector<heongpu::DeviceVector<Data64>>
+        encode_V_inv_matrixs_v2(Vandermonde& vandermonde, int start_level);
+
+        __host__ Polynomial generate_eval_mod_poly(const EvalModConfig& config,
+                                                   int max_deg);
 
         ///////////////////////////////////////////////////
 
@@ -1464,6 +2050,15 @@ namespace heongpu
             Ciphertext<Scheme::CKKS>& cipher,
             std::vector<heongpu::DeviceVector<Data64>>& matrix,
             std::vector<std::vector<std::vector<int>>>& diags_matrices_bsgs_,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        __host__ Ciphertext<Scheme::CKKS> multiply_matrix_v2(
+            Ciphertext<Scheme::CKKS>& cipher,
+            std::vector<heongpu::DeviceVector<Data64>>& matrix,
+            std::vector<std::vector<std::vector<int>>>& diags_matrices_bsgs_,
+            std::vector<std::vector<int>>& diags_matrices_bsgs_rot_n1_,
+            std::vector<std::vector<int>>& diags_matrices_bsgs_rot_n2_,
             Galoiskey<Scheme::CKKS>& galois_key,
             const ExecutionOptions& options = ExecutionOptions());
 
@@ -1480,6 +2075,11 @@ namespace heongpu
                       Galoiskey<Scheme::CKKS>& galois_key,
                       const ExecutionOptions& options = ExecutionOptions());
 
+        __host__ std::vector<Ciphertext<Scheme::CKKS>>
+        coeff_to_slot_v2(Ciphertext<Scheme::CKKS>& cipher,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         const ExecutionOptions& options = ExecutionOptions());
+
         __host__ Ciphertext<Scheme::CKKS> solo_coeff_to_slot(
             Ciphertext<Scheme::CKKS>& cipher,
             Galoiskey<Scheme::CKKS>& galois_key,
@@ -1491,10 +2091,22 @@ namespace heongpu
                       Galoiskey<Scheme::CKKS>& galois_key,
                       const ExecutionOptions& options = ExecutionOptions());
 
+        __host__ Ciphertext<Scheme::CKKS>
+        slot_to_coeff_v2(Ciphertext<Scheme::CKKS>& cipher0,
+                         Ciphertext<Scheme::CKKS>& cipher1,
+                         Galoiskey<Scheme::CKKS>& galois_key,
+                         const ExecutionOptions& options = ExecutionOptions());
+
         __host__ Ciphertext<Scheme::CKKS> solo_slot_to_coeff(
             Ciphertext<Scheme::CKKS>& cipher,
             Galoiskey<Scheme::CKKS>& galois_key,
             const ExecutionOptions& options = ExecutionOptions());
+
+        __host__ Ciphertext<Scheme::CKKS>
+        mod_up_from_q0(Ciphertext<Scheme::CKKS>& cipher,
+                       Switchkey<Scheme::CKKS>* swk_dense_to_sparse = nullptr,
+                       Switchkey<Scheme::CKKS>* swk_sparse_to_dense = nullptr,
+                       const ExecutionOptions& options = ExecutionOptions());
 
         __host__ Ciphertext<Scheme::CKKS>
         exp_scaled(Ciphertext<Scheme::CKKS>& cipher,
@@ -1503,6 +2115,53 @@ namespace heongpu
 
         __host__ Ciphertext<Scheme::CKKS> exp_taylor_approximation(
             Ciphertext<Scheme::CKKS>& cipher, Relinkey<Scheme::CKKS>& relin_key,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        // EvalMod (v2). The output carries the scale label of the input
+        // (regular bootstrapping v2 convention).
+        __host__ Ciphertext<Scheme::CKKS>
+        eval_mod(Ciphertext<Scheme::CKKS>& cipher,
+                 Relinkey<Scheme::CKKS>& relin_key,
+                 const ExecutionOptions& options = ExecutionOptions());
+
+        // EvalMod (v2) with a tracked output scale: the input slots are
+        // relabeled to eval_mod_config_.scaling_factor_ (x = (I + eps) / K),
+        // the result holds q_diff * eps (q_diff * sin(2 pi eps) / (2 pi)
+        // without arcsine) and its scale label is the actual scale, which is
+        // output_scale up to floating point rounding. With arcsine the
+        // double angle output is brought to scaling_factor_ and the arcsine
+        // polynomial is evaluated with target scale output_scale; without
+        // arcsine the double angle output is brought to output_scale.
+        __host__ Ciphertext<Scheme::CKKS>
+        eval_mod_scaled(Ciphertext<Scheme::CKKS>& cipher, double output_scale,
+                        Relinkey<Scheme::CKKS>& relin_key,
+                        const ExecutionOptions& options = ExecutionOptions());
+
+        // Number of levels consumed by eval_mod (sine, double angle, arcsine).
+        __host__ int eval_mod_depth() const;
+
+        // Computes x^power (MONOMIAL) or T_power(x) (CHEBYSHEV).
+        __host__ void
+        gen_power(std::unordered_map<int, Ciphertext<Scheme::CKKS>>& cipher,
+                  int power, PolyType poly_type,
+                  Relinkey<Scheme::CKKS>& relin_key,
+                  const ExecutionOptions& options = ExecutionOptions());
+
+        __host__ Ciphertext<Scheme::CKKS>
+        evaluate_poly(Ciphertext<Scheme::CKKS>& cipher, double target_scale,
+                      const Polynomial& pol, Relinkey<Scheme::CKKS>& relin_key,
+                      const ExecutionOptions& options);
+
+        __host__ Ciphertext<Scheme::CKKS> evaluate_poly_from_polynomial_basis(
+            double target_scale, int target_level, const Polynomial& pol,
+            std::unordered_map<int, Ciphertext<Scheme::CKKS>>& powered_ciphers,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        __host__ Ciphertext<Scheme::CKKS> evaluate_poly_recurse(
+            int target_level, double target_scale, const Polynomial& pol,
+            int log_split,
+            std::unordered_map<int, Ciphertext<Scheme::CKKS>>& powered_ciphers,
+            Relinkey<Scheme::CKKS>& relin_key,
             const ExecutionOptions& options = ExecutionOptions());
 
         // Double-hoisting BSGS matrix×vector algorithm
@@ -1580,22 +2239,18 @@ namespace heongpu
 
         // Pre-computed encoded parameters
         // CtoS part
-        DeviceVector<Data64> encoded_constant_1over2_;
         DeviceVector<Data64> encoded_complex_minus_iover2_;
         // StoC part
         DeviceVector<Data64> encoded_complex_i_;
         // Scale part
         DeviceVector<Data64> encoded_complex_minus_iscale_;
+        // HalfBoot: -i * q0 / (4 pi * input scale), encoded at scale_boot_,
+        // re-encoded when the scale of the input ciphertext changes.
+        DeviceVector<Data64> encoded_halfboot_minus_iscale_;
+        double halfboot_input_scale_ = 0.0;
         // Exponentiate part
         DeviceVector<Data64> encoded_complex_iscaleoverr_;
         // Sinus taylor part
-        DeviceVector<Data64> encoded_constant_1_;
-        // DeviceVector<Data64> encoded_constant_1over2_; // we already have it.
-        DeviceVector<Data64> encoded_constant_1over6_;
-        DeviceVector<Data64> encoded_constant_1over24_;
-        DeviceVector<Data64> encoded_constant_1over120_;
-        DeviceVector<Data64> encoded_constant_1over720_;
-        DeviceVector<Data64> encoded_constant_1over5040_;
     };
 
     /**
@@ -1621,9 +2276,13 @@ namespace heongpu
          * @param scale Scaling factor.
          * @param config Bootstrapping configuration.
          */
+        __host__ void generate_bootstrapping_params(
+            const double scale, const BootstrappingConfig& config,
+            const arithmetic_bootstrapping_type& boot_type);
+
         __host__ void
-        generate_bootstrapping_params(const double scale,
-                                      const BootstrappingConfig& config);
+        generate_bootstrapping_params_v2(const double scale,
+                                         const BootstrappingConfigV2& config);
 
         __host__ std::vector<int> bootstrapping_key_indexs()
         {
@@ -1635,6 +2294,45 @@ namespace heongpu
             }
 
             return key_indexs_;
+        }
+
+        /**
+         * @brief Rotation steps needed by regular_halfbootstrapping_v2
+         * (CoeffToSlot only; the conjugation key is always part of a
+         * Galoiskey). Subset of bootstrapping_key_indexs().
+         */
+        __host__ std::vector<int> halfbootstrapping_key_indexs()
+        {
+            if (!boot_context_generated_)
+            {
+                throw std::invalid_argument(
+                    "HalfBoot key indexs can not be returned before "
+                    "generating Bootstrapping parameters!");
+            }
+
+            return halfboot_key_indexs_;
+        }
+
+        /**
+         * @brief Sets the scale label of the ciphertexts returned by
+         * regular_halfbootstrapping_v2 (default: the scale given to
+         * generate_bootstrapping_params_v2). The value is reached exactly by
+         * choosing the EvalMod output scale accordingly; it is separate from
+         * the EvalMod scaling factor and from the CoeffToSlot encoding scale.
+         */
+        __host__ void set_halfboot_output_scale(double output_scale)
+        {
+            if (!(output_scale > 0.0))
+            {
+                throw std::invalid_argument(
+                    "HalfBoot output scale must be positive!");
+            }
+            halfboot_output_scale_ = output_scale;
+        }
+
+        __host__ double halfboot_output_scale() const
+        {
+            return halfboot_output_scale_;
         }
 
         /**
@@ -1658,6 +2356,71 @@ namespace heongpu
             Ciphertext<Scheme::CKKS>& input1,
             Galoiskey<Scheme::CKKS>& galois_key,
             Relinkey<Scheme::CKKS>& relin_key,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        /**
+         * @brief Performs regular bootstrapping with non-sparse key support
+         * (v2).
+         *
+         * Implements the optimized bootstrapping algorithm from the paper:
+         * "Efficient Bootstrapping for Approximate Homomorphic Encryption with
+         * Non-Sparse Keys" (https://eprint.iacr.org/2020/1203.pdf)
+         *
+         * @param input1 Input ciphertext at maximum depth (must have
+         * current_decomp_count == 1).
+         * @param galois_key Galois key for rotation operations.
+         * @param relin_key Relinearization key for EvalMod polynomial
+         * evaluation.
+         * @param swk_dense_to_sparse Optional switch key from dense to sparse
+         * representation.
+         * @param swk_sparse_to_dense Optional switch key from sparse to dense
+         * representation.
+         * @param options Execution options (stream, storage, etc.).
+         * @return Ciphertext Bootstrapped ciphertext with refreshed modulus
+         * chain.
+         *
+         * @throws std::invalid_argument if bootstrapping context not
+         * initialized.
+         * @throws std::logic_error if input ciphertext not at maximum depth.
+         */
+        __host__ Ciphertext<Scheme::CKKS> regular_bootstrapping_v2(
+            Ciphertext<Scheme::CKKS>& input1,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            Switchkey<Scheme::CKKS>* swk_dense_to_sparse = nullptr,
+            Switchkey<Scheme::CKKS>* swk_sparse_to_dense = nullptr,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        /**
+         * @brief HalfBoot (v2): ModUp + CoeffToSlot + EvalMod, without
+         * SlotToCoeff (RtF transciphering, Lattigo/RtF HalfBoot).
+         *
+         * The input is a level-0 ciphertext (one modulus) whose plaintext
+         * coefficients are round(Delta_in * m_k), Delta_in = input1.scale()
+         * (typically q0 / message_ratio, any value, not necessarily a power of
+         * two). If Delta_in is much smaller than q0 / message_ratio the
+         * ciphertext is first multiplied by round((q0 / message_ratio) /
+         * Delta_in).
+         *
+         * The result is the pair (ct0, ct1) of the two CoeffToSlot halves
+         * after EvalMod: the real parts of their slots hold m_k for the first
+         * and the second half of the coefficients, respectively. Their scale
+         * label is halfboot_output_scale() (exactly), so that decode returns
+         * m_k. One extra level below EvalMod is consumed to bring the
+         * EvalMod output to that scale (the RtF "DiffScaleModulus").
+         *
+         * Uses the CoeffToSlot matrices and the EvalMod polynomials (incl.
+         * arcsine if eval_mod_config.arcsine_deg_ > 0) of
+         * generate_bootstrapping_params_v2. Needs the rotation keys of
+         * halfbootstrapping_key_indexs().
+         */
+        __host__ std::pair<Ciphertext<Scheme::CKKS>, Ciphertext<Scheme::CKKS>>
+        regular_halfbootstrapping_v2(
+            Ciphertext<Scheme::CKKS>& input1,
+            Galoiskey<Scheme::CKKS>& galois_key,
+            Relinkey<Scheme::CKKS>& relin_key,
+            Switchkey<Scheme::CKKS>* swk_dense_to_sparse = nullptr,
+            Switchkey<Scheme::CKKS>* swk_sparse_to_dense = nullptr,
             const ExecutionOptions& options = ExecutionOptions());
 
         /**
@@ -2848,19 +3611,9 @@ namespace heongpu
         // Encoded One
         DeviceVector<Data64> encoded_constant_one_;
 
-        // Bit bootstrapping
-        DeviceVector<Data64> encoded_constant_minus_1over4_;
-
         // Gate bootstrapping
-        DeviceVector<Data64> encoded_constant_1over3_;
-        DeviceVector<Data64> encoded_constant_2over3_;
         DeviceVector<Data64> encoded_complex_minus_2over6j_;
-        DeviceVector<Data64> encoded_constant_minus_2over6_;
         DeviceVector<Data64> encoded_complex_2over6j_;
-        DeviceVector<Data64> encoded_constant_2over6_;
-        // DeviceVector<Data64> we have -> encoded_complex_minus_iscale_
-        DeviceVector<Data64> encoded_constant_pioversome_;
-        DeviceVector<Data64> encoded_constant_minus_pioversome_;
     };
 
 } // namespace heongpu

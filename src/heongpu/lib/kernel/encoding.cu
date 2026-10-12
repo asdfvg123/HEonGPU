@@ -61,7 +61,7 @@ namespace heongpu
         {
             for (int i = 0; i < coeff_modulus_count; i++)
             {
-                Data64 temp = OPERATOR_GPU_64::reduce(coeff, modulus[i]);
+                Data64 temp = reduce_exact_two_word(coeff, modulus[i]);
                 plaintext[idx + (i << n_power)] =
                     OPERATOR_GPU_64::sub(modulus[i].value, temp, modulus[i]);
             }
@@ -71,7 +71,7 @@ namespace heongpu
             for (int i = 0; i < coeff_modulus_count; i++)
             {
                 plaintext[idx + (i << n_power)] =
-                    OPERATOR_GPU_64::reduce(coeff, modulus[i]);
+                    reduce_exact_two_word(coeff, modulus[i]);
             }
         }
     }
@@ -153,7 +153,7 @@ namespace heongpu
         {
             for (int i = 0; i < coeff_modulus_count; i++)
             {
-                Data64 temp = OPERATOR_GPU_64::reduce(coeff, modulus[i]);
+                Data64 temp = reduce_exact_two_word(coeff, modulus[i]);
                 plaintext[idx + (i << n_power)] =
                     OPERATOR_GPU_64::sub(modulus[i].value, temp, modulus[i]);
             }
@@ -163,7 +163,7 @@ namespace heongpu
             for (int i = 0; i < coeff_modulus_count; i++)
             {
                 plaintext[idx + (i << n_power)] =
-                    OPERATOR_GPU_64::reduce(coeff, modulus[i]);
+                    reduce_exact_two_word(coeff, modulus[i]);
             }
         }
 
@@ -183,7 +183,7 @@ namespace heongpu
         {
             for (int i = 0; i < coeff_modulus_count; i++)
             {
-                Data64 temp = OPERATOR_GPU_64::reduce(coeff2, modulus[i]);
+                Data64 temp = reduce_exact_two_word(coeff2, modulus[i]);
                 plaintext[idx + offset + (i << n_power)] =
                     OPERATOR_GPU_64::sub(modulus[i].value, temp, modulus[i]);
             }
@@ -193,7 +193,7 @@ namespace heongpu
             for (int i = 0; i < coeff_modulus_count; i++)
             {
                 plaintext[idx + offset + (i << n_power)] =
-                    OPERATOR_GPU_64::reduce(coeff2, modulus[i]);
+                    reduce_exact_two_word(coeff2, modulus[i]);
             }
         }
     }

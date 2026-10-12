@@ -856,6 +856,268 @@ namespace heongpu
 //     }
 
     // Helper inside HEOperator<Scheme::RTF> (or a free function with access to n, Q_size_, tables)
+    __host__ void HEOperator<Scheme::RTF>::accumulate_plain_products_ntt(
+        const Data64* packed_baby, const Data64* slab, const int* j_of_m,
+        int M, Data64* out_ntt, cudaStream_t stream)
+    {
+        if (M <= 0)
+            return;
+        dim3 grid((n + 255) / 256, (unsigned) Q_size_, 2), blk(256);
+        cipherplain_multiply_accumulate_block_kernel<<<grid, blk, 0, stream>>>(
+            packed_baby, slab, j_of_m, out_ntt, modulus_->data(), M,
+            (int) Q_size_, n_power);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+    }
+
+    // ------------------------------------------------------------------
+    // Hoisted rotations
+    // ------------------------------------------------------------------
+    __host__ int HEOperator<Scheme::RTF>::row_galois_elt(
+        const Galoiskey<Scheme::RTF>& galois_key, int shift) const
+    {
+        if (shift == 0)
+            throw std::invalid_argument("row_galois_elt: shift 0");
+        return steps_to_galois_elt(shift, n, galois_key.group_order_);
+    }
+
+    __host__ int HEOperator<Scheme::RTF>::column_galois_elt(
+        const Galoiskey<Scheme::RTF>& galois_key) const
+    {
+        return galois_key.galois_elt_zero;
+    }
+
+    __host__ bool HEOperator<Scheme::RTF>::has_galois_key(
+        const Galoiskey<Scheme::RTF>& galois_key, int galois_elt) const
+    {
+        if (galois_elt == galois_key.galois_elt_zero)
+            return (galois_key.storage_type_ == storage_type::DEVICE)
+                       ? galois_key.zero_device_location_.size() > 0
+                       : galois_key.zero_host_location_.size() > 0;
+        return galois_key.device_location_.count(galois_elt) > 0 ||
+               galois_key.host_location_.count(galois_elt) > 0;
+    }
+
+    __host__ const Data64* HEOperator<Scheme::RTF>::galois_key_device_ptr(
+        Galoiskey<Scheme::RTF>& galois_key, int galois_elt,
+        std::vector<DeviceVector<Data64>>& staged, cudaStream_t stream)
+    {
+        if (galois_elt == galois_key.galois_elt_zero)
+        {
+            if (galois_key.storage_type_ == storage_type::DEVICE)
+                return galois_key.zero_device_location_.data();
+            staged.emplace_back(galois_key.zero_host_location_, stream);
+            return staged.back().data();
+        }
+        // A key already on the device is used directly: either all keys are
+        // device-resident or this one was prefetched from host storage.
+        auto dev_it = galois_key.device_location_.find(galois_elt);
+        if (dev_it != galois_key.device_location_.end())
+            return dev_it->second.data();
+        auto host_it = galois_key.host_location_.find(galois_elt);
+        if (galois_key.storage_type_ == storage_type::DEVICE ||
+            host_it == galois_key.host_location_.end())
+            throw std::logic_error(
+                "hoisted rotation: no Galois key for element " +
+                std::to_string(galois_elt));
+        staged.emplace_back(host_it->second, stream);
+        return staged.back().data();
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::ntt_ciphertexts_inplace(
+        Data64* data, int count, bool forward, cudaStream_t stream)
+    {
+        if (count <= 0)
+            return;
+        if (forward)
+        {
+            gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+                .n_power = n_power,
+                .ntt_type = gpuntt::FORWARD,
+                .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+                .zero_padding = false,
+                .stream = stream};
+            gpuntt::GPU_NTT_Inplace(data, ntt_table_->data(), modulus_->data(),
+                                    cfg_ntt, count * 2 * Q_size_, Q_size_);
+        }
+        else
+        {
+            gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+                .n_power = n_power,
+                .ntt_type = gpuntt::INVERSE,
+                .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+                .zero_padding = false,
+                .mod_inverse = n_inverse_->data(),
+                .stream = stream};
+            gpuntt::GPU_NTT_Inplace(data, intt_table_->data(),
+                                    modulus_->data(), cfg_intt,
+                                    count * 2 * Q_size_, Q_size_);
+        }
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::apply_galois_hoisted_raw(
+        const Data64* input, const std::vector<int>& galois_elts,
+        const std::vector<Data64*>& outputs,
+        Galoiskey<Scheme::RTF>& galois_key, cudaStream_t stream)
+    {
+        if (galois_elts.size() != outputs.size())
+            throw std::invalid_argument(
+                "apply_galois_hoisted: one output per Galois element");
+        if (galois_elts.empty())
+            return;
+
+        int digits = 0;
+        switch (static_cast<int>(galois_key.key_type))
+        {
+            case 1: // KEYSWITCHING_METHOD_I: one digit per Q prime
+                digits = Q_size_;
+                break;
+            case 2: // KEYSWITCHING_METHOD_II: dnum digits of |P| primes
+                digits = d;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "apply_galois_hoisted: KEYSWITCHING_METHOD_I or _II only");
+        }
+
+        // Resolve every key before doing any work.
+        std::vector<DeviceVector<Data64>> staged;
+        staged.reserve(galois_elts.size());
+        std::vector<const Data64*> keys;
+        keys.reserve(galois_elts.size());
+        for (int elt : galois_elts)
+            keys.push_back(
+                galois_key_device_ptr(galois_key, elt, staged, stream));
+
+        const size_t decomp_words = (size_t) digits * Q_prime_size_ * n;
+        const size_t acc_words = (size_t) 2 * Q_prime_size_ * n;
+        DeviceVector<Data64> work(decomp_words + acc_words, stream);
+        Data64* decomp = work.data();
+        Data64* acc = decomp + decomp_words;
+        Data64* ct = const_cast<Data64*>(input);
+
+        // ModUp of c1, once: digits lifted to QP, then NTT.
+        if (digits == Q_size_ && static_cast<int>(galois_key.key_type) == 1)
+        {
+            // c0 goes to `acc` (scratch, overwritten by the inner product).
+            bfv_duplicate_kernel<<<dim3((n >> 8), Q_size_, 2), 256, 0,
+                                   stream>>>(ct, acc, decomp, modulus_->data(),
+                                             n_power, Q_prime_size_);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+        else
+        {
+            base_conversion_DtoQtilde_relin_kernel<<<dim3((n >> 8), d, 1), 256,
+                                                     0, stream>>>(
+                ct + ((size_t) Q_size_ << n_power), decomp, modulus_->data(),
+                base_change_matrix_D_to_Q_tilda_->data(),
+                Mi_inv_D_to_Q_tilda_->data(), prod_D_to_Q_tilda_->data(),
+                I_j_->data(), I_location_->data(), n_power, Q_size_,
+                Q_prime_size_, d);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = stream};
+        gpuntt::GPU_NTT_Inplace(decomp, ntt_table_->data(), modulus_->data(),
+                                cfg_ntt, digits * Q_prime_size_,
+                                Q_prime_size_);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = n_inverse_->data(),
+            .stream = stream};
+
+        const int iteration_count_1 = digits / 4;
+        const int iteration_count_2 = digits % 4;
+        for (size_t k = 0; k < galois_elts.size(); k++)
+        {
+            if (outputs[k] == input)
+                throw std::invalid_argument(
+                    "apply_galois_hoisted: output aliases the input");
+
+            // inner product with this element's key (NTT domain, QP)
+            keyswitch_multiply_accumulate_kernel<<<
+                dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
+                decomp, keys[k], acc, modulus_->data(), n_power,
+                Q_prime_size_, iteration_count_1, iteration_count_2);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            gpuntt::GPU_NTT_Inplace(acc, intt_table_->data(),
+                                    modulus_->data(), cfg_intt,
+                                    2 * Q_prime_size_, Q_prime_size_);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+            // ModDown, + c0, automorphism
+            divide_round_lastq_permute_bfv_kernel<<<dim3((n >> 8), Q_size_, 2),
+                                                    256, 0, stream>>>(
+                acc, ct, outputs[k], modulus_->data(), half_p_->data(),
+                half_mod_->data(), last_q_modinv_->data(), galois_elts[k],
+                n_power, Q_prime_size_, Q_size_, P_size_);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::apply_galois_hoisted(
+        Ciphertext<Scheme::RTF>& input, const std::vector<int>& galois_elts,
+        std::vector<Ciphertext<Scheme::RTF>>& outputs,
+        Galoiskey<Scheme::RTF>& galois_key, const ExecutionOptions& options)
+    {
+        if (input.relinearization_required_)
+            throw std::invalid_argument("Ciphertext can not be rotated!");
+        if (input.in_ntt_domain_)
+            throw std::invalid_argument("Ciphertext should be in intt domain");
+        if (input.memory_size() < (2 * n * Q_size_))
+            throw std::invalid_argument("Invalid Ciphertexts size!");
+        cudaStream_t stream = options.stream_;
+        if (!input.is_on_device())
+            input.store_in_device(stream);
+
+        outputs.clear();
+        outputs.reserve(galois_elts.size());
+        std::vector<Data64*> ptrs;
+        for (size_t k = 0; k < galois_elts.size(); k++)
+        {
+            outputs.push_back(operator_from_ciphertext(input, stream));
+            outputs.back().in_ntt_domain_ = false;
+            ptrs.push_back(outputs.back().data());
+        }
+        apply_galois_hoisted_raw(input.data(), galois_elts, ptrs, galois_key,
+                                 stream);
+    }
+
+    __host__ void HEOperator<Scheme::RTF>::rotate_rows_hoisted(
+        Ciphertext<Scheme::RTF>& input, const std::vector<int>& shifts,
+        std::vector<Ciphertext<Scheme::RTF>>& outputs,
+        Galoiskey<Scheme::RTF>& galois_key, const ExecutionOptions& options)
+    {
+        std::vector<int> elts;
+        std::vector<size_t> where;
+        for (size_t k = 0; k < shifts.size(); k++)
+            if (shifts[k] != 0)
+            {
+                elts.push_back(row_galois_elt(galois_key, shifts[k]));
+                where.push_back(k);
+            }
+        std::vector<Ciphertext<Scheme::RTF>> rotated;
+        apply_galois_hoisted(input, elts, rotated, galois_key, options);
+        outputs.clear();
+        outputs.resize(shifts.size());
+        for (size_t k = 0; k < shifts.size(); k++)
+            if (shifts[k] == 0)
+                outputs[k] = input;
+        for (size_t j = 0; j < where.size(); j++)
+            outputs[where[j]] = std::move(rotated[j]);
+    }
+
     __host__ heongpu::DeviceVector<Data64>
     HEOperator<Scheme::RTF>::batched_plain_to_ntt_slab(
         const Data64* base_plain,                 // big blob of all plain diagonals
@@ -1602,24 +1864,88 @@ namespace heongpu
                                         .set_storage_type(storage_type::DEVICE)
                                         .set_initial_location(true);
 
-        if (input.in_ntt_domain_) {
-            transform_from_ntt_inplace(input, local_opt);
-        }
-
         const int    N  = static_cast<int>(n);
         const int    H  = N >> 1;
         const int    g2 = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(H))));
 
         const size_t Q  = static_cast<size_t>(Q_size_);
 
-        heongpu::Ciphertext<heongpu::Scheme::RTF> ct_orig   = input;
-        heongpu::Ciphertext<heongpu::Scheme::RTF> ct_swapped;
-        rotate_columns(input, ct_swapped, galois_key_bs, local_opt);
+        // Contract: group 0 holds the diagonals applied to the input (shifts
+        // in [0, N/2)), the optional group 1 those applied to the
+        // column-swapped input (shifts in [N/2, N)). matrix_groups[g][0]
+        // holds shifts[g].size() encoded diagonals of N words each, every
+        // diagonal pre-rotated by its giant step (see
+        // HEHERA::gen_FV_S2C_Matrix). Validate it: indexing a missing group
+        // or diagonal used to read out of bounds and crash.
+        const int num_groups = static_cast<int>(shifts_caller.size());
+        if (num_groups < 1 || num_groups > 2 ||
+            matrix_groups_caller.size() != shifts_caller.size())
+        {
+            throw std::invalid_argument(
+                "multiply_matrix_bsgs: expects 1 or 2 diagonal groups (input, "
+                "column-swapped input) and one matrix blob per group.");
+        }
+        bool any_diagonal = false;
+        bool needs_giant_step = false;
+        for (int g = 0; g < num_groups; ++g)
+        {
+            const auto& shifts = shifts_caller[g];
+            if (shifts.empty())
+                continue;
+            any_diagonal = true;
+            if (matrix_groups_caller[g].empty() ||
+                matrix_groups_caller[g][0].size() <
+                    shifts.size() * static_cast<size_t>(N))
+            {
+                throw std::invalid_argument(
+                    "multiply_matrix_bsgs: matrix blob of group " +
+                    std::to_string(g) + " must hold " +
+                    std::to_string(shifts.size()) + " diagonals of N words.");
+            }
+            const int lo = g * H;
+            for (int s : shifts)
+            {
+                if (s < lo || s >= lo + H)
+                {
+                    throw std::invalid_argument(
+                        "multiply_matrix_bsgs: shift " + std::to_string(s) +
+                        " of group " + std::to_string(g) + " is outside [" +
+                        std::to_string(lo) + ", " + std::to_string(lo + H) +
+                        ").");
+                }
+                if (s - lo >= g2)
+                    needs_giant_step = true;
+            }
+        }
+        if (!any_diagonal)
+        {
+            throw std::invalid_argument("multiply_matrix_bsgs: no diagonals.");
+        }
+        if (!galois_key_bs.galois_key_generated_)
+        {
+            throw std::invalid_argument(
+                "multiply_matrix_bsgs: baby-step Galois key is not generated "
+                "(HEHERA: call set_galois_key_bs() before S2C_FV()).");
+        }
+        if (needs_giant_step && !galois_key_gs.galois_key_generated_)
+        {
+            throw std::invalid_argument(
+                "multiply_matrix_bsgs: giant-step Galois key is not "
+                "generated.");
+        }
 
-        std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> inputs;
-        inputs.reserve(2);
-        inputs.emplace_back(std::move(ct_orig));
-        inputs.emplace_back(std::move(ct_swapped));
+        if (input.in_ntt_domain_) {
+            transform_from_ntt_inplace(input, local_opt);
+        }
+
+        // inputs[0] = input, inputs[1] = input with its two rows swapped
+        // (only computed when group 1 has diagonals).
+        std::vector<heongpu::Ciphertext<heongpu::Scheme::RTF>> inputs(num_groups);
+        inputs[0] = input;
+        if (num_groups == 2 && !shifts_caller[1].empty())
+        {
+            rotate_columns(input, inputs[1], galois_key_bs, local_opt);
+        }
 
         heongpu::Ciphertext<heongpu::Scheme::RTF> final_result;
         bool result_initialized = false;
@@ -1652,7 +1978,8 @@ namespace heongpu
                 return out;
             };
 
-        for (int group_idx = 0; group_idx < 2; ++group_idx) {
+        for (int group_idx = 0; group_idx < num_groups; ++group_idx) {
+            if (shifts_caller[group_idx].empty()) continue;
             auto& current_input_ct = inputs[group_idx];
 
             // nvtxRangeId_t rangeBS = nvtxRangeStartA("BS");
@@ -2319,14 +2646,22 @@ namespace heongpu
         // TODO: make it efficient
         int iteration_count_1 = d / 4;
         int iteration_count_2 = d % 4;
-        if (galois_key.storage_type_ == storage_type::DEVICE)
+        // A key already on the device is used directly: either all keys are
+        // device-resident, or this one was prefetched from host storage
+        // (Galoiskey::prefetch_many_async, used by multiply_matrix_bsgs).
+        auto dev_it = galois_key.device_location_.find(galois_elt);
+        if (dev_it != galois_key.device_location_.end())
         {
             keyswitch_multiply_accumulate_kernel<<<
                 dim3((n >> 8), Q_prime_size_, 1), 256, 0, stream>>>(
-                temp2_rotation, galois_key.device_location_[galois_elt].data(),
-                temp3_rotation, modulus_->data(), n_power, Q_prime_size_,
-                iteration_count_1, iteration_count_2);
+                temp2_rotation, dev_it->second.data(), temp3_rotation,
+                modulus_->data(), n_power, Q_prime_size_, iteration_count_1,
+                iteration_count_2);
             HEONGPU_CUDA_CHECK(cudaGetLastError());
+        }
+        else if (galois_key.storage_type_ == storage_type::DEVICE)
+        {
+            throw std::logic_error("Galois key not present on the device!");
         }
         else
         {

@@ -8,6 +8,7 @@
 
 #include "cuda_runtime.h"
 #include "modular_arith.cuh"
+#include "reduction.cuh"
 #include "defines.h"
 
 namespace heongpu
@@ -49,6 +50,11 @@ namespace heongpu
                                                       Data64* out,
                                                       Modulus64* modulus,
                                                       int n_power);
+
+    __global__ void
+    cipher_constant_plain_multiplication_kernel(Data64* in1, double in2,
+                                                Data64* out, Modulus64* modulus,
+                                                double two_pow_64, int n_power);
 
     __global__ void cipherplain_multiply_accumulate_kernel(
         Data64* in1, Data64* in2, Data64* out, Modulus64* modulus,
@@ -121,5 +127,25 @@ namespace heongpu
         const Data64* __restrict__ upper_inc,    // [Q]
         const Data64  upper_thresh,
         int n_power, int Q, int B);
+    __global__ void cipher_div_by_i_kernel(Data64* in1, Data64* out,
+                                           unsigned long long* ntt_table,
+                                           Modulus64* modulus, int n_power);
+
+    __global__ void cipher_mult_by_i_kernel(Data64* in1, Data64* out,
+                                            unsigned long long* ntt_table,
+                                            Modulus64* modulus, int n_power);
+
+    __global__ void cipher_mult_by_gaussian_integer_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* out,
+        Data64* ntt_table, Modulus64* modulus, int n_power);
+
+    __global__ void cipher_add_by_gaussian_integer_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* out,
+        Data64* ntt_table, Modulus64* modulus, int n_power);
+
+    __global__ void cipher_mult_by_gaussian_integer_and_add_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* accumulator,
+        Data64* ntt_table, Modulus64* modulus, int n_power);
+
 } // namespace heongpu
 #endif // HEONGPU_MULTIPLICATION_H

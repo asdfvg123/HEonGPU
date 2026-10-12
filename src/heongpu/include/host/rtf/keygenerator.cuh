@@ -57,6 +57,17 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions());
 
         /**
+         * @brief Generates a sparse ternary secret key with exactly
+         * sk.hamming_weight nonzero coefficients in {-1, 1} (collision-free,
+         * same sampler as HEKeyGenerator<CKKS>::generate_secret_key_v2).
+         * Use with Secretkey<RTF>(context, h), e.g. h = 192 for RtF, and
+         * convert with Secretkey<CKKS>(rtf_key) to share it with CKKS.
+         */
+        __host__ void generate_secret_key_v2(
+            Secretkey<Scheme::RTF>& sk,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        /**
          * @brief Generates a public key using a secret key.
          *
          * @param pk Reference to the Publickey object where the generated

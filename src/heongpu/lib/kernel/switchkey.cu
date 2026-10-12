@@ -978,6 +978,12 @@ namespace heongpu
             Data64 r_mul = OPERATOR_GPU_64::mult(
                 r_, prod_D_to_Qtilda[i + (block_y * Q_tilda)], modulus[i]);
             r_mul = OPERATOR_GPU_64::sub(temp, r_mul, modulus[i]);
+            // partial[j] is reduced modulo a digit prime, which can be much
+            // larger than modulus[i] (e.g. 61-bit q0 -> 22-bit or 45-bit
+            // primes); the Barrett product is then only congruent, not
+            // reduced. Downstream kernels (negacyclic permutation, BFV
+            // decryption) need values in [0, q).
+            r_mul = OPERATOR_GPU_64::reduce_forced(r_mul, modulus[i]);
             output[location_out + (i << n_power)] = r_mul;
         }
     }

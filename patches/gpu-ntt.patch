@@ -1,0 +1,1270 @@
+diff --git a/src/include/common/modular_arith.cuh b/src/include/common/modular_arith.cuh
+index c6c3555..c35ea93 100644
+--- a/src/include/common/modular_arith.cuh
++++ b/src/include/common/modular_arith.cuh
+@@ -39,7 +39,12 @@ template <typename T1> struct Modulus
+   private:
+     __host__ T1 bit_generator() const
+     {
+-        return static_cast<T1>(log2(value) + 1);
++        // Integer bit length: log2() in double rounds values just below a
++        // power of two up (e.g. 2^61 - 1 -> 62 bits), which breaks Barrett.
++        T1 bits = 0;
++        for (T1 v = value; v != 0; v >>= 1)
++            bits++;
++        return bits;
+     }
+ 
+     __host__ T1 mu_generator() const
+@@ -102,6 +107,17 @@ namespace modular_operation_cpu
+                                              : result;
+         }
+ 
++        // Compute Shoup precomputed value: floor(b * 2^W / q)
++        static __host__ T1 compute_shoup(const T1& b,
++                                         const Modulus<T1>& modulus)
++        {
++            using T2 =
++                typename std::conditional<std::is_same<T1, Data32>::value,
++                                          Data64, __uint128_t>::type;
++            return static_cast<T1>(
++                (static_cast<T2>(b) << (sizeof(T1) * 8)) / modulus.value);
++        }
++
+         // Modular Exponentiation
+         // result = (base ^ exponent) % modulus
+         static __host__ T1 exp(T1 base, T1 exponent, const Modulus<T1>& modulus)
+@@ -214,11 +230,31 @@ namespace modular_operation_gpu
+             __device__ __forceinline__ uint128_t
+             operator<<(const unsigned& shift)
+             {
++                // Shifting a 64-bit word by 64 or more is undefined in C++;
++                // CUDA 13 miscompiles it, so handle 0 and >= 64 explicitly.
+                 uint128_t result;
+ 
+-                result.value.y = value.y << shift;
+-                result.value.y = (value.x >> (64 - shift)) | result.value.y;
+-                result.value.x = value.x << shift;
++                if (shift == 0)
++                {
++                    result.value.x = value.x;
++                    result.value.y = value.y;
++                }
++                else if (shift < 64)
++                {
++                    result.value.y =
++                        (value.y << shift) | (value.x >> (64 - shift));
++                    result.value.x = value.x << shift;
++                }
++                else if (shift < 128)
++                {
++                    result.value.y = value.x << (shift - 64);
++                    result.value.x = 0;
++                }
++                else
++                {
++                    result.value.x = 0;
++                    result.value.y = 0;
++                }
+ 
+                 return result;
+             }
+@@ -226,11 +262,32 @@ namespace modular_operation_gpu
+             __device__ __forceinline__ uint128_t
+             operator>>(const unsigned& shift)
+             {
++                // Shifting a 64-bit word by 64 or more is undefined in C++;
++                // CUDA 13 miscompiles it (a 61-bit Barrett modulus shifts by
++                // exactly 64), so handle 0 and >= 64 explicitly.
+                 uint128_t result;
+ 
+-                result.value.x = value.x >> shift;
+-                result.value.x = (value.y << (64 - shift)) | result.value.x;
+-                result.value.y = value.y >> shift;
++                if (shift == 0)
++                {
++                    result.value.x = value.x;
++                    result.value.y = value.y;
++                }
++                else if (shift < 64)
++                {
++                    result.value.x =
++                        (value.x >> shift) | (value.y << (64 - shift));
++                    result.value.y = value.y >> shift;
++                }
++                else if (shift < 128)
++                {
++                    result.value.x = value.y >> (shift - 64);
++                    result.value.y = 0;
++                }
++                else
++                {
++                    result.value.x = 0;
++                    result.value.y = 0;
++                }
+ 
+                 return result;
+             }
+@@ -383,6 +440,35 @@ namespace modular_operation_gpu
+             return result;
+         }
+ 
++        // Shoup modular multiplication: result = (a * w) mod q
++        // Requires precomputed w_shoup = floor(w * 2^64 / q).
++        // Uses 1x mul.hi + 2x mul.lo instead of Barrett's 2x mult128.
++        static __device__ __forceinline__ T1
++        mult_shoup(const T1& a, const T1& w, const T1& w_shoup,
++                   const Modulus<T1>& modulus)
++        {
++            T1 q = modulus.value;
++            T1 q_hat;
++            asm("mul.hi.u64 %0, %1, %2;" : "=l"(q_hat) : "l"(a), "l"(w_shoup));
++            T1 lo;
++            asm("mul.lo.u64 %0, %1, %2;" : "=l"(lo) : "l"(a), "l"(w));
++            T1 sub;
++            asm("mul.lo.u64 %0, %1, %2;" : "=l"(sub) : "l"(q_hat), "l"(q));
++            T1 result = lo - sub;
++            return (result >= q) ? (result - q) : result;
++        }
++
++        // Shoup reduction: result = a mod q (a < q^2)
++        // Uses the identity: reduce(a, q) = mult_shoup(a, 1, 1_shoup, q)
++        // where 1_shoup = floor(2^64 / q). But simpler: just Barrett reduce.
++        // For Shoup consistency, we keep Barrett reduce here since
++        // reduce doesn't benefit from Shoup (no precomputed constant).
++        static __device__ __forceinline__ T1
++        reduce_shoup(const T1& input, const Modulus<T1>& modulus)
++        {
++            return reduce(input, modulus);
++        }
++
+         // Forced Reduction
+         // result = input1 % modulus
+         static __device__ __forceinline__ T1 reduce(T1* input1,
+diff --git a/src/include/ntt_merge/ntt_fast16.cuh b/src/include/ntt_merge/ntt_fast16.cuh
+new file mode 100644
+index 0000000..8587a59
+--- /dev/null
++++ b/src/include/ntt_merge/ntt_fast16.cuh
+@@ -0,0 +1,68 @@
++// Fast path for N = 2^16, 64-bit, X^N + 1 (no zero padding): radix-8 register
++// butterflies with Shoup multiplication and lazy reduction. Same two-pass data
++// flow and the same twiddle tables (Root<T>[m + (omega >> t)], bit-reversed
++// powers, N entries per prime) as the merge kernels, outputs fully reduced, so
++// the results are bit-identical to ForwardCore / InverseCore and their
++// ModulusOrdered / PolyOrdered variants.
++//
++// Enabled by GPUNTT_FAST16=1 (read once), or set_enabled() at run time.
++//
++// The Shoup companions of a twiddle table (and of an n^-1 array) are built on
++// the device once per table pointer and cached. Every kernel checks its prime's
++// cache entry against the live table and modulus (q and the last twiddle, which
++// determines the whole table) and, if the entry is missing or stale (a table
++// freed and reallocated at the same address with other contents), computes the
++// companions on the fly for that launch and asks the host to rebuild the cache
++// on the next call. A stale cache therefore costs speed, never correctness.
++#ifndef NTT_FAST16_H
++#define NTT_FAST16_H
++
++#include <cuda_runtime.h>
++#include "modular_arith.cuh"
++
++namespace gpuntt
++{
++    namespace fast16
++    {
++        typedef unsigned long long u64;
++
++        enum OrderMode
++        {
++            ORDER_NONE = 0, // limb z uses prime z % mod_count
++            ORDER_MODULUS = 1, // limb z uses prime order[z % mod_count]
++            ORDER_POLY = 2 // limb order[z] uses prime z % mod_count
++        };
++
++        struct Request
++        {
++            const u64* in;
++            u64* out;
++            const u64* table; // forward or inverse root table
++            const Modulus<u64>* modulus; // nullptr: single prime q_single
++            u64 q_single;
++            const u64* ninv; // inverse only; nullptr: single ninv_single
++            u64 ninv_single;
++            const int* order; // ORDER_MODULUS / ORDER_POLY only
++            int order_mode;
++            int batch;
++            int mod_count;
++            cudaStream_t stream;
++        };
++
++        // GPUNTT_FAST16 != 0, unless overridden with set_enabled.
++        bool enabled();
++        // 1: on, 0: off, -1: follow GPUNTT_FAST16 again.
++        void set_enabled(int value);
++        // Frees every cached Shoup table (synchronizes the device).
++        void clear_cache();
++
++        // Run the fast NTT / INTT. Returns false (and launches nothing) when the
++        // request is outside what the fast path covers; the caller then runs
++        // the generic kernels.
++        bool forward(const Request& request);
++        bool inverse(const Request& request);
++
++    } // namespace fast16
++} // namespace gpuntt
++
++#endif // NTT_FAST16_H
+diff --git a/src/lib/ntt_merge/ntt.cu b/src/lib/ntt_merge/ntt.cu
+index 9cb1f30..1a3f570 100644
+--- a/src/lib/ntt_merge/ntt.cu
++++ b/src/lib/ntt_merge/ntt.cu
+@@ -5,10 +5,57 @@
+ // Paper: https://eprint.iacr.org/2023/1410
+ 
+ #include "ntt.cuh"
++#include "ntt_fast16.cuh"
+ 
+ namespace gpuntt
+ {
+ 
++    // N = 2^16, 64-bit, X^N + 1, no zero padding: radix-8 Shoup kernels when
++    // GPUNTT_FAST16=1 (see ntt_fast16.cuh). Returns true if the call is done.
++    template <typename T>
++    static bool
++    try_fast16(T* device_in, T* device_out, Root<T>* root_of_unity_table,
++               const Modulus<T>* modulus, T q_single,
++               const Ninverse<T>* n_inverse, Ninverse<T> n_inverse_single,
++               const int* order, int order_mode, int n_power, type ntt_type,
++               ReductionPolynomial reduction_poly, bool zero_padding,
++               cudaStream_t stream, int batch_size, int mod_count)
++    {
++        if constexpr (std::is_same<T, Data64>::value)
++        {
++            if (n_power != 16 || reduction_poly != ReductionPolynomial::X_N_plus ||
++                zero_padding || (ntt_type != FORWARD && ntt_type != INVERSE) ||
++                !fast16::enabled())
++            {
++                return false;
++            }
++            fast16::Request r;
++            r.in = device_in;
++            r.out = device_out;
++            r.table = root_of_unity_table;
++            r.modulus = modulus;
++            r.q_single = q_single;
++            r.ninv = n_inverse;
++            r.ninv_single = n_inverse_single;
++            r.order = order;
++            r.order_mode = order_mode;
++            r.batch = batch_size;
++            r.mod_count = mod_count;
++            r.stream = stream;
++            const bool done = (ntt_type == FORWARD) ? fast16::forward(r)
++                                                    : fast16::inverse(r);
++            if (done)
++            {
++                GPUNTT_CUDA_CHECK(cudaGetLastError());
++            }
++            return done;
++        }
++        else
++        {
++            return false;
++        }
++    }
++
+     template <typename T>
+     __device__ void CooleyTukeyUnit(T& U, T& V, const Root<T>& root,
+                                     const Modulus<T>& modulus)
+@@ -1004,6 +1051,15 @@ namespace gpuntt
+             throw std::invalid_argument("Invalid n_power range!");
+         }
+ 
++        if (try_fast16<T>(device_in, device_out, root_of_unity_table, nullptr,
++                          modulus.value, nullptr, cfg.mod_inverse, nullptr,
++                          fast16::ORDER_NONE, cfg.n_power, cfg.ntt_type,
++                          cfg.reduction_poly, cfg.zero_padding, cfg.stream,
++                          batch_size, 1))
++        {
++            return;
++        }
++
+         auto kernel_parameters = (cfg.ntt_type == FORWARD)
+                                      ? CreateForwardNTTKernel<T>()
+                                      : CreateInverseNTTKernel<T>();
+@@ -1167,6 +1223,14 @@ namespace gpuntt
+             throw std::invalid_argument("Invalid n_power range!");
+         }
+ 
++        if (try_fast16<T>(device_in, device_out, root_of_unity_table, modulus,
++                          0, cfg.mod_inverse, 0, nullptr, fast16::ORDER_NONE,
++                          cfg.n_power, cfg.ntt_type, cfg.reduction_poly,
++                          cfg.zero_padding, cfg.stream, batch_size, mod_count))
++        {
++            return;
++        }
++
+         auto kernel_parameters = (cfg.ntt_type == FORWARD)
+                                      ? CreateForwardNTTKernel<T>()
+                                      : CreateInverseNTTKernel<T>();
+@@ -1856,6 +1920,14 @@ namespace gpuntt
+             throw std::invalid_argument("Invalid n_power range!");
+         }
+ 
++        if (try_fast16<T>(device_in, device_out, root_of_unity_table, modulus,
++                          0, cfg.mod_inverse, 0, order, fast16::ORDER_MODULUS,
++                          cfg.n_power, cfg.ntt_type, cfg.reduction_poly,
++                          cfg.zero_padding, cfg.stream, batch_size, mod_count))
++        {
++            return;
++        }
++
+         auto kernel_parameters = (cfg.ntt_type == FORWARD)
+                                      ? CreateForwardNTTKernel<T>()
+                                      : CreateInverseNTTKernel<T>();
+@@ -2537,6 +2609,14 @@ namespace gpuntt
+             throw std::invalid_argument("Invalid n_power range!");
+         }
+ 
++        if (try_fast16<T>(device_in, device_out, root_of_unity_table, modulus,
++                          0, cfg.mod_inverse, 0, order, fast16::ORDER_POLY,
++                          cfg.n_power, cfg.ntt_type, cfg.reduction_poly,
++                          cfg.zero_padding, cfg.stream, batch_size, mod_count))
++        {
++            return;
++        }
++
+         auto kernel_parameters = (cfg.ntt_type == FORWARD)
+                                      ? CreateForwardNTTKernel<T>()
+                                      : CreateInverseNTTKernel<T>();
+diff --git a/src/lib/ntt_merge/ntt_fast16.cu b/src/lib/ntt_merge/ntt_fast16.cu
+new file mode 100644
+index 0000000..48821ce
+--- /dev/null
++++ b/src/lib/ntt_merge/ntt_fast16.cu
+@@ -0,0 +1,924 @@
++// Fast path for N = 2^16, 64-bit, X^N + 1. See ntt_fast16.cuh.
++//
++// Ported from the GPU-NTT 32332ce fast16 patch (klss_lazy
++// patches/gpu-ntt-fast16.patch) to this GPU-NTT version: same kernels, plus
++//   - limb -> (prime, polynomial) mapping for the plain RNS, the
++//     modulus-ordered and the poly-ordered APIs, and the single-prime API;
++//   - Shoup tables built on the device, with a per-launch validity check
++//     against the live table so a stale cache entry cannot change results.
++//
++// Data flow (identical to ForwardCore / InverseCore for N = 2^16):
++//   forward stage s (0..15) pairs G and G + 2^(15-s) with twiddle
++//   table[2^s + (G >> (16-s))], U' = U + V w, V' = U - V w;
++//   inverse stage s' (0..15) pairs G and G + 2^s' with the same index formula
++//   for s = 15 - s', U' = U + V, V' = (U - V) w, then times n^-1.
++
++#include "ntt_fast16.cuh"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++namespace gpuntt
++{
++    namespace fast16
++    {
++        namespace
++        {
++            constexpr int LOGN = 16;
++            constexpr size_t NN = size_t(1) << LOGN;
++
++            // floor(w * 2^64 / q). Only used to build the cache and on the
++            // (rare) stale-cache path, so a library division is fine.
++            __device__ __noinline__ u64 shoup_slow(u64 w, u64 q)
++            {
++                return (u64) (((unsigned __int128) w << 64) / q);
++            }
++
++            __device__ __forceinline__ u64 mul_shoup(u64 a, u64 w, u64 ws,
++                                                     u64 q)
++            {
++                u64 qh = __umul64hi(a, ws);
++                u64 r = a * w - qh * q;
++                return (r >= q) ? (r - q) : r;
++            }
++
++            // Lazy variants. Shoup without the final correction returns a
++            // value in [0, 2q) for any 64-bit input; CT keeps values in
++            // [0, 4q) and GS in [0, 2q); q < 2^62 keeps every intermediate
++            // below 2^64. Only the kernel exits reduce fully, so the stored
++            // results match the strict kernels.
++            __device__ __forceinline__ u64 mul_shoup_lazy(u64 a, u64 w, u64 ws,
++                                                          u64 q)
++            {
++                u64 qh = __umul64hi(a, ws);
++                return a * w - qh * q;
++            }
++            __device__ __forceinline__ void ct_lazy(u64& U, u64& V, u64 w,
++                                                    u64 ws, u64 q, u64 q2)
++            {
++                u64 u0 = (U >= q2) ? (U - q2) : U;
++                u64 t = mul_shoup_lazy(V, w, ws, q);
++                U = u0 + t;
++                V = u0 + q2 - t;
++            }
++            __device__ __forceinline__ void gs_lazy(u64& U, u64& V, u64 w,
++                                                    u64 ws, u64 q, u64 q2)
++            {
++                u64 s = U + V;
++                u64 d = U + q2 - V;
++                U = (s >= q2) ? (s - q2) : s;
++                V = mul_shoup_lazy(d, w, ws, q);
++            }
++            __device__ __forceinline__ u64 reduce4(u64 x, u64 q, u64 q2)
++            {
++                x = (x >= q2) ? (x - q2) : x;
++                return (x >= q) ? (x - q) : x;
++            }
++            __device__ __forceinline__ u64 reduce2(u64 x, u64 q)
++            {
++                return (x >= q) ? (x - q) : x;
++            }
++
++            // radix-8 Cooley-Tukey step on x[0..7] with distances 4, 2, 1 in
++            // register index space: pairs (i,i+4) use wA, (i,i+2) use
++            // wB[i>>2], (2k,2k+1) use wC[k]
++            __device__ __forceinline__ void
++            ct8_lazy(u64* x, u64 wA, u64 sA, const u64* wB, const u64* sB,
++                     const u64* wC, const u64* sC, u64 q, u64 q2)
++            {
++#pragma unroll
++                for (int i = 0; i < 4; i++)
++                    ct_lazy(x[i], x[i + 4], wA, sA, q, q2);
++                ct_lazy(x[0], x[2], wB[0], sB[0], q, q2);
++                ct_lazy(x[1], x[3], wB[0], sB[0], q, q2);
++                ct_lazy(x[4], x[6], wB[1], sB[1], q, q2);
++                ct_lazy(x[5], x[7], wB[1], sB[1], q, q2);
++#pragma unroll
++                for (int k = 0; k < 4; k++)
++                    ct_lazy(x[2 * k], x[2 * k + 1], wC[k], sC[k], q, q2);
++            }
++            // radix-8 Gentleman-Sande step: (2k,2k+1) with wC[k], then
++            // (i,i+2) with wB[i>>2], then (i,i+4) with wA
++            __device__ __forceinline__ void
++            gs8_lazy(u64* x, u64 wA, u64 sA, const u64* wB, const u64* sB,
++                     const u64* wC, const u64* sC, u64 q, u64 q2)
++            {
++#pragma unroll
++                for (int k = 0; k < 4; k++)
++                    gs_lazy(x[2 * k], x[2 * k + 1], wC[k], sC[k], q, q2);
++                gs_lazy(x[0], x[2], wB[0], sB[0], q, q2);
++                gs_lazy(x[1], x[3], wB[0], sB[0], q, q2);
++                gs_lazy(x[4], x[6], wB[1], sB[1], q, q2);
++                gs_lazy(x[5], x[7], wB[1], sB[1], q, q2);
++#pragma unroll
++                for (int i = 0; i < 4; i++)
++                    gs_lazy(x[i], x[i + 4], wA, sA, q, q2);
++            }
++
++            __device__ __forceinline__ void ld2(const u64* __restrict__ p,
++                                                u64* o)
++            {
++                ulonglong2 v = __ldg(reinterpret_cast<const ulonglong2*>(p));
++                o[0] = v.x;
++                o[1] = v.y;
++            }
++            __device__ __forceinline__ void ld4(const u64* __restrict__ p,
++                                                u64* o)
++            {
++                ld2(p, o);
++                ld2(p + 2, o + 2);
++            }
++
++            struct KParams
++            {
++                const u64* tab; // twiddle table, NN entries per prime
++                const u64* tabs; // Shoup table: tab_moduli * NN, then
++                                 // tab_moduli x {q, tab[NN - 1]}
++                int tab_moduli;
++                const Modulus<u64>* modulus; // nullptr: q_single
++                u64 q_single;
++                const u64* ninv; // nullptr: ninv_single / ninv_single_shoup
++                const u64* ninvs; // ninv_moduli x {ninv, q, shoup, 0}
++                int ninv_moduli;
++                u64 ninv_single;
++                u64 ninv_single_shoup;
++                const int* order;
++                int order_mode;
++                int mod_count;
++                int* stale; // mapped host flag, may be nullptr
++            };
++
++            // Per-block view of one limb: prime index, data offset, modulus,
++            // twiddle tables, and whether the cached Shoup table is valid.
++            struct Limb
++            {
++                size_t base;
++                const u64* T;
++                const u64* TS;
++                u64 q;
++                int mi;
++                bool ok;
++            };
++
++            __device__ __forceinline__ void flag_stale(const KParams& p)
++            {
++                if (p.stale != nullptr && threadIdx.x == 0)
++                    *(volatile int*) p.stale = 1;
++            }
++
++            __device__ __forceinline__ Limb limb_of(const KParams& p)
++            {
++                Limb L;
++                const int z = blockIdx.y;
++                int pz;
++                if (p.order_mode == ORDER_POLY)
++                {
++                    L.mi = z % p.mod_count;
++                    pz = p.order[z];
++                }
++                else if (p.order_mode == ORDER_MODULUS)
++                {
++                    L.mi = p.order[z % p.mod_count];
++                    pz = z;
++                }
++                else
++                {
++                    L.mi = z % p.mod_count;
++                    pz = z;
++                }
++                L.base = (size_t) pz << LOGN;
++                L.q = p.modulus ? p.modulus[L.mi].value : p.q_single;
++                L.T = p.tab + ((size_t) L.mi << LOGN);
++                L.ok = L.mi < p.tab_moduli;
++                L.TS = p.tabs + ((size_t) (L.ok ? L.mi : 0) << LOGN);
++                if (L.ok)
++                {
++                    const u64* H =
++                        p.tabs + ((size_t) p.tab_moduli << LOGN) + 2 * L.mi;
++                    L.ok = (__ldg(H) == L.q) &&
++                           (__ldg(H + 1) == __ldg(L.T + (NN - 1)));
++                }
++                if (!L.ok)
++                    flag_stale(p);
++                return L;
++            }
++
++            // twiddles (w, w_shoup) for 1, 2 or 4 consecutive table entries
++            __device__ __forceinline__ void tw1(const Limb& L, int i, u64& w,
++                                                u64& s)
++            {
++                w = __ldg(L.T + i);
++                s = L.ok ? __ldg(L.TS + i) : shoup_slow(w, L.q);
++            }
++            __device__ __forceinline__ void tw2(const Limb& L, int i, u64* w,
++                                                u64* s)
++            {
++                ld2(L.T + i, w);
++                if (L.ok)
++                    ld2(L.TS + i, s);
++                else
++                {
++                    s[0] = shoup_slow(w[0], L.q);
++                    s[1] = shoup_slow(w[1], L.q);
++                }
++            }
++            __device__ __forceinline__ void tw4(const Limb& L, int i, u64* w,
++                                                u64* s)
++            {
++                ld4(L.T + i, w);
++                if (L.ok)
++                    ld4(L.TS + i, s);
++                else
++                {
++#pragma unroll
++                    for (int k = 0; k < 4; k++)
++                        s[k] = shoup_slow(w[k], L.q);
++                }
++            }
++
++            constexpr int TILES = 4; // 512-element tiles per block
++            constexpr int TPAD = 576; // padded tile stride in shared memory
++            // exchange between the stride-64 and stride-8 patterns, and
++            // between stride-8 and contiguous: each has its own
++            // conflict-free padding
++            __device__ __forceinline__ int PA(int e) { return e + 8 * (e >> 6); }
++            __device__ __forceinline__ int PB(int e) { return e + (e >> 3); }
++
++            // ------- forward pass 2: stages 7..15 on contiguous 512-element
++            // tiles (in place) -------
++            __global__ void __launch_bounds__(64 * TILES, 4)
++                fwd_tile_kernel(u64* data, const KParams p)
++            {
++                const Limb L = limb_of(p);
++                const u64 q = L.q;
++                const u64 q2 = q << 1;
++                const int tl = threadIdx.x >> 6, j = threadIdx.x & 63;
++                const int t = blockIdx.x * TILES + tl;
++                u64* tile = data + L.base + (size_t) t * 512;
++                extern __shared__ u64 sh[];
++                u64* S = sh + tl * TPAD;
++
++                u64 x[8];
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = tile[j + 64 * i];
++
++                u64 wA, sA, wB[2], sB[2], wC[4], sC[4];
++                tw1(L, 128 + t, wA, sA);
++                tw2(L, 256 + 2 * t, wB, sB);
++                tw4(L, 512 + 4 * t, wC, sC);
++                ct8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[PA(j + 64 * i)] = x[i];
++                __syncthreads();
++                const int g = j >> 3, e0 = (g << 6) + (j & 7);
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[PA(e0 + 8 * i)];
++
++                tw1(L, 1024 + 8 * t + g, wA, sA);
++                tw2(L, 2048 + 16 * t + 2 * g, wB, sB);
++                tw4(L, 4096 + 32 * t + 4 * g, wC, sC);
++                ct8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[PB(e0 + 8 * i)] = x[i];
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[PB(8 * j + i)];
++
++                tw1(L, 8192 + 64 * t + j, wA, sA);
++                tw2(L, 16384 + 128 * t + 2 * j, wB, sB);
++                tw4(L, 32768 + 256 * t + 4 * j, wC, sC);
++                ct8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                ulonglong2* out = reinterpret_cast<ulonglong2*>(tile + 8 * j);
++#pragma unroll
++                for (int k = 0; k < 4; k++)
++                    out[k] = make_ulonglong2(reduce4(x[2 * k], q, q2),
++                                             reduce4(x[2 * k + 1], q, q2));
++            }
++
++            // ------- forward pass 1: stages 0..6, 128-point column NTTs (16
++            // columns per block) -------
++            __global__ void __launch_bounds__(256, 4)
++                fwd_col_kernel(const u64* in, u64* out, const KParams p)
++            {
++                const Limb L = limb_of(p);
++                const u64 q = L.q;
++                const u64 q2 = q << 1;
++                const int c = threadIdx.x & 15, k = threadIdx.x >> 4;
++                const u64* colin = in + L.base + blockIdx.x * 16 + c;
++                u64* colp = out + L.base + blockIdx.x * 16 + c;
++                __shared__ u64 S[128 * 16];
++
++                u64 x[8];
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = colin[512 * (k + 16 * i)];
++
++                u64 wA, sA, wB[2], sB[2], wC[4], sC[4];
++                tw1(L, 1, wA, sA);
++                tw2(L, 2, wB, sB);
++                tw4(L, 4, wC, sC);
++                ct8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[(k + 16 * i) * 16 + c] = x[i];
++                __syncthreads();
++                const int g = k >> 1, e0 = (g << 4) + (k & 1);
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[(e0 + 2 * i) * 16 + c];
++
++                tw1(L, 8 + g, wA, sA);
++                tw2(L, 16 + 2 * g, wB, sB);
++                tw4(L, 32 + 4 * g, wC, sC);
++                ct8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[(e0 + 2 * i) * 16 + c] = x[i];
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[(8 * k + i) * 16 + c];
++                {
++                    u64 w6[4], s6[4];
++                    tw4(L, 64 + 4 * k, w6, s6);
++#pragma unroll
++                    for (int u = 0; u < 4; u++)
++                        ct_lazy(x[2 * u], x[2 * u + 1], w6[u], s6[u], q, q2);
++                }
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    colp[512 * (8 * k + i)] = reduce4(x[i], q, q2);
++            }
++
++            // ------- inverse pass A: stages 0..8 (distances 1..256) on
++            // contiguous tiles -------
++            __global__ void __launch_bounds__(64 * TILES, 4)
++                inv_tile_kernel(const u64* in, u64* out, const KParams p)
++            {
++                const Limb L = limb_of(p);
++                const u64 q = L.q;
++                const u64 q2 = q << 1;
++                const int tl = threadIdx.x >> 6, j = threadIdx.x & 63;
++                const int t = blockIdx.x * TILES + tl;
++                const u64* tin = in + L.base + (size_t) t * 512;
++                u64* tile = out + L.base + (size_t) t * 512;
++                extern __shared__ u64 sh[];
++                u64* S = sh + tl * TPAD;
++
++                u64 x[8];
++                const ulonglong2* tin2 =
++                    reinterpret_cast<const ulonglong2*>(tin + 8 * j);
++#pragma unroll
++                for (int k = 0; k < 4; k++)
++                {
++                    ulonglong2 v = tin2[k];
++                    x[2 * k] = v.x;
++                    x[2 * k + 1] = v.y;
++                }
++
++                u64 wA, sA, wB[2], sB[2], wC[4], sC[4];
++                tw1(L, 8192 + 64 * t + j, wA, sA);
++                tw2(L, 16384 + 128 * t + 2 * j, wB, sB);
++                tw4(L, 32768 + 256 * t + 4 * j, wC, sC);
++                gs8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[PB(8 * j + i)] = x[i];
++                __syncthreads();
++                const int g = j >> 3, e0 = (g << 6) + (j & 7);
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[PB(e0 + 8 * i)];
++
++                tw1(L, 1024 + 8 * t + g, wA, sA);
++                tw2(L, 2048 + 16 * t + 2 * g, wB, sB);
++                tw4(L, 4096 + 32 * t + 4 * g, wC, sC);
++                gs8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[PA(e0 + 8 * i)] = x[i];
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[PA(j + 64 * i)];
++
++                tw1(L, 128 + t, wA, sA);
++                tw2(L, 256 + 2 * t, wB, sB);
++                tw4(L, 512 + 4 * t, wC, sC);
++                gs8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    tile[j + 64 * i] = reduce2(x[i], q);
++            }
++
++            // ------- inverse pass B: stages 9..15 (rows 1..64 apart),
++            // columns, times n^-1 (in place) -------
++            __global__ void __launch_bounds__(256, 4)
++                inv_col_kernel(u64* data, const KParams p)
++            {
++                const Limb L = limb_of(p);
++                const u64 q = L.q;
++                const u64 q2 = q << 1;
++                const int c = threadIdx.x & 15, k = threadIdx.x >> 4;
++                u64* colp = data + L.base + blockIdx.x * 16 + c;
++                __shared__ u64 S[128 * 16];
++
++                u64 x[8];
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = colp[512 * (8 * k + i)];
++                {
++                    u64 w6[4], s6[4];
++                    tw4(L, 64 + 4 * k, w6, s6);
++#pragma unroll
++                    for (int u = 0; u < 4; u++)
++                        gs_lazy(x[2 * u], x[2 * u + 1], w6[u], s6[u], q, q2);
++                }
++
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[(8 * k + i) * 16 + c] = x[i];
++                __syncthreads();
++                const int g = k >> 1, e0 = (g << 4) + (k & 1);
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[(e0 + 2 * i) * 16 + c];
++
++                u64 wA, sA, wB[2], sB[2], wC[4], sC[4];
++                tw1(L, 8 + g, wA, sA);
++                tw2(L, 16 + 2 * g, wB, sB);
++                tw4(L, 32 + 4 * g, wC, sC);
++                gs8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    S[(e0 + 2 * i) * 16 + c] = x[i];
++                __syncthreads();
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    x[i] = S[(k + 16 * i) * 16 + c];
++
++                tw1(L, 1, wA, sA);
++                tw2(L, 2, wB, sB);
++                tw4(L, 4, wC, sC);
++                gs8_lazy(x, wA, sA, wB, sB, wC, sC, q, q2);
++
++                u64 ni, nis = 0;
++                if (p.ninv != nullptr)
++                {
++                    ni = __ldg(p.ninv + L.mi);
++                    bool ok = L.mi < p.ninv_moduli;
++                    if (ok)
++                    {
++                        const u64* E = p.ninvs + 4 * L.mi;
++                        ok = (__ldg(E) == ni) && (__ldg(E + 1) == q);
++                        nis = __ldg(E + 2);
++                    }
++                    if (!ok)
++                    {
++                        nis = shoup_slow(ni, q);
++                        flag_stale(p);
++                    }
++                }
++                else
++                {
++                    ni = p.ninv_single;
++                    nis = p.ninv_single_shoup;
++                }
++#pragma unroll
++                for (int i = 0; i < 8; i++)
++                    colp[512 * (k + 16 * i)] = mul_shoup(x[i], ni, nis, q);
++            }
++
++            // ------- cache builders -------
++            // out: moduli * NN Shoup words (entry 0 of each prime is unused by
++            // X^N + 1 and left 0), then moduli x {q, tab[NN - 1]}
++            __global__ void build_tw_kernel(const u64* tab,
++                                            const Modulus<u64>* modulus,
++                                            u64 q_single, int moduli, u64* out)
++            {
++                const int mi = blockIdx.y;
++                const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
++                const u64 q = modulus ? modulus[mi].value : q_single;
++                const u64* T = tab + ((size_t) mi << LOGN);
++                out[((size_t) mi << LOGN) + i] =
++                    (i == 0 || q == 0) ? 0 : shoup_slow(T[i], q);
++                if (i == 0)
++                {
++                    // header: the kernels check it against the live table
++                    u64* H = out + ((size_t) moduli << LOGN) + 2 * mi;
++                    H[0] = q;
++                    H[1] = T[NN - 1];
++                }
++            }
++
++            // out: moduli x {ninv, q, shoup(ninv), 0}
++            __global__ void build_ninv_kernel(const u64* ninv,
++                                              const Modulus<u64>* modulus,
++                                              int moduli, u64* out)
++            {
++                const int mi = blockIdx.x * blockDim.x + threadIdx.x;
++                if (mi >= moduli)
++                    return;
++                const u64 q = modulus[mi].value;
++                const u64 n = ninv[mi];
++                out[4 * mi] = n;
++                out[4 * mi + 1] = q;
++                out[4 * mi + 2] = (q == 0) ? 0 : shoup_slow(n, q);
++                out[4 * mi + 3] = 0;
++            }
++
++            // ------- host side: cache -------
++            // Entries are built asynchronously on the caller's stream (no host
++            // synchronization); a call on another stream waits on the
++            // entry's event. GPU-NTT's 64-bit Barrett already requires
++            // q < 2^62 (mu must fit 64 bits), which is also what the lazy
++            // reduction needs.
++            struct Entry
++            {
++                u64* dev = nullptr;
++                int moduli = 0;
++                cudaStream_t stream = 0;
++                cudaEvent_t ready = nullptr;
++            };
++
++            struct State
++            {
++                std::mutex mu;
++                std::unordered_map<const void*, Entry> tw;
++                std::unordered_map<const void*, Entry> ninv;
++                std::map<std::pair<const int*, int>, int> order;
++                std::vector<Entry> retired; // outgrown, freed on reset
++                int* stale_host = nullptr;
++                int* stale_dev = nullptr;
++                bool flag_tried = false;
++                int verbose = -1;
++                size_t bytes = 0;
++                size_t builds = 0;
++                size_t resets = 0;
++            };
++
++            State& state()
++            {
++                // never destroyed: no CUDA calls during static destruction
++                static State* s = new State();
++                return *s;
++            }
++
++            std::atomic<int> g_override{-1};
++
++            bool verbose(State& st)
++            {
++                if (st.verbose < 0)
++                {
++                    const char* e = std::getenv("GPUNTT_FAST16_VERBOSE");
++                    st.verbose = e ? std::atoi(e) : 0;
++                }
++                return st.verbose != 0;
++            }
++
++            void release(Entry& e)
++            {
++                if (e.ready != nullptr)
++                    cudaEventDestroy(e.ready);
++                cudaFree(e.dev);
++                e = Entry();
++            }
++
++            void drop_all_locked(State& st)
++            {
++                cudaDeviceSynchronize(); // kernels in flight may read them
++                for (auto& kv : st.tw)
++                    release(kv.second);
++                for (auto& kv : st.ninv)
++                    release(kv.second);
++                for (auto& e : st.retired)
++                    release(e);
++                st.tw.clear();
++                st.ninv.clear();
++                st.retired.clear();
++                st.order.clear();
++                st.bytes = 0;
++                cudaGetLastError();
++            }
++
++            void ensure_flag_locked(State& st)
++            {
++                if (st.flag_tried)
++                    return;
++                st.flag_tried = true;
++                int* h = nullptr;
++                if (cudaHostAlloc(&h, sizeof(int),
++                                  cudaHostAllocMapped |
++                                      cudaHostAllocPortable) != cudaSuccess)
++                {
++                    cudaGetLastError();
++                    return;
++                }
++                int* d = nullptr;
++                if (cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess)
++                {
++                    cudaGetLastError();
++                    cudaFreeHost(h);
++                    return;
++                }
++                *(volatile int*) h = 0;
++                st.stale_host = h;
++                st.stale_dev = d;
++            }
++
++            // Returns the cached entry for `key` if it covers `moduli` primes
++            // (making `s` wait for its build), otherwise builds a new one on
++            // `s` with `launch_build(dev)`.
++            template <typename Build>
++            const Entry* entry_locked(State& st,
++                                      std::unordered_map<const void*, Entry>& m,
++                                      const void* key, int moduli, size_t words,
++                                      cudaStream_t s, const char* what,
++                                      Build launch_build)
++            {
++                auto it = m.find(key);
++                if (it != m.end() && it->second.moduli >= moduli)
++                {
++                    if (it->second.stream != s)
++                        cudaStreamWaitEvent(s, it->second.ready, 0);
++                    return &it->second;
++                }
++
++                Entry e;
++                if (cudaMalloc(&e.dev, words * sizeof(u64)) != cudaSuccess)
++                {
++                    cudaGetLastError();
++                    return nullptr;
++                }
++                launch_build(e.dev);
++                if (cudaGetLastError() != cudaSuccess ||
++                    cudaEventCreateWithFlags(&e.ready,
++                                             cudaEventDisableTiming) !=
++                        cudaSuccess ||
++                    cudaEventRecord(e.ready, s) != cudaSuccess)
++                {
++                    cudaGetLastError();
++                    release(e);
++                    return nullptr;
++                }
++                e.moduli = moduli;
++                e.stream = s;
++                st.bytes += words * sizeof(u64);
++                st.builds++;
++                if (verbose(st))
++                    std::fprintf(stderr,
++                                 "[fast16] built %s Shoup table for %p: %d "
++                                 "primes, %.2f MiB (cache %.2f MiB, %zu "
++                                 "builds)\n",
++                                 what, key, moduli,
++                                 words * sizeof(u64) / 1048576.0,
++                                 st.bytes / 1048576.0, st.builds);
++                if (it != m.end())
++                {
++                    st.retired.push_back(it->second); // may still be in use
++                    it->second = e;
++                    return &it->second;
++                }
++                return &(m[key] = e);
++            }
++
++            const Entry* tw_entry_locked(State& st, const u64* tab,
++                                         const Modulus<u64>* modulus,
++                                         u64 q_single, int moduli,
++                                         cudaStream_t s)
++            {
++                const size_t words = ((size_t) moduli << LOGN) + 2 * moduli;
++                return entry_locked(
++                    st, st.tw, tab, moduli, words, s, "twiddle",
++                    [&](u64* dev)
++                    {
++                        build_tw_kernel<<<dim3(NN / 256, moduli), 256, 0, s>>>(
++                            tab, modulus, q_single, moduli, dev);
++                    });
++            }
++
++            const Entry* ninv_entry_locked(State& st, const u64* ninv,
++                                           const Modulus<u64>* modulus,
++                                           int moduli, cudaStream_t s)
++            {
++                return entry_locked(
++                    st, st.ninv, ninv, moduli, (size_t) moduli * 4, s, "n^-1",
++                    [&](u64* dev)
++                    {
++                        build_ninv_kernel<<<(moduli + 127) / 128, 128, 0, s>>>(
++                            ninv, modulus, moduli, dev);
++                    });
++            }
++
++            // number of primes a modulus-ordered call can address:
++            // max(order[0..cnt)) + 1, read once per (order, cnt).
++            int ordered_moduli_locked(State& st, const int* order, int cnt,
++                                      cudaStream_t s)
++            {
++                auto key = std::make_pair(order, cnt);
++                auto it = st.order.find(key);
++                if (it != st.order.end())
++                    return it->second;
++                std::vector<int> h(cnt);
++                if (cudaMemcpyAsync(h.data(), order, cnt * sizeof(int),
++                                    cudaMemcpyDeviceToHost, s) != cudaSuccess ||
++                    cudaStreamSynchronize(s) != cudaSuccess)
++                {
++                    cudaGetLastError();
++                    return -1;
++                }
++                int m = 0;
++                for (int v : h)
++                {
++                    if (v < 0)
++                        return -1;
++                    if (v + 1 > m)
++                        m = v + 1;
++                }
++                st.order[key] = m;
++                return m;
++            }
++
++            inline bool aligned16(const void* p)
++            {
++                return (reinterpret_cast<uintptr_t>(p) & 15) == 0;
++            }
++
++            bool run(const Request& r, bool fwd)
++            {
++                if (r.batch <= 0 || r.batch > 65535 || r.mod_count <= 0)
++                    return false;
++                if (!r.in || !r.out || !r.table)
++                    return false;
++                if (!aligned16(r.in) || !aligned16(r.out) ||
++                    !aligned16(r.table))
++                    return false;
++                if (r.order_mode < ORDER_NONE || r.order_mode > ORDER_POLY)
++                    return false;
++                if (r.order_mode != ORDER_NONE && r.order == nullptr)
++                    return false;
++                if (r.modulus == nullptr && (r.mod_count != 1 || r.q_single == 0))
++                    return false;
++                if (!fwd && r.ninv == nullptr && r.modulus != nullptr)
++                    return false;
++
++                const cudaStream_t s = r.stream;
++                State& st = state();
++                std::lock_guard<std::mutex> lk(st.mu);
++                ensure_flag_locked(st);
++                if (st.stale_host != nullptr &&
++                    *(volatile int*) st.stale_host != 0)
++                {
++                    // a kernel found a stale or too small cache entry:
++                    // drop everything, entries are rebuilt on demand
++                    drop_all_locked(st);
++                    *(volatile int*) st.stale_host = 0;
++                    st.resets++;
++                    if (verbose(st))
++                        std::fprintf(stderr,
++                                     "[fast16] stale Shoup cache detected, "
++                                     "cleared (%zu resets)\n",
++                                     st.resets);
++                }
++
++                // primes the call addresses. For the modulus-ordered API an
++                // existing entry is used as is (the kernels bounds-check the
++                // prime index, so a too small entry only costs a rebuild);
++                // otherwise the order array is read once.
++                int moduli = r.mod_count;
++                if (r.order_mode == ORDER_MODULUS)
++                {
++                    auto it = st.tw.find(r.table);
++                    moduli = (it != st.tw.end())
++                                 ? it->second.moduli
++                                 : ordered_moduli_locked(
++                                       st, r.order,
++                                       std::min(r.batch, r.mod_count), s);
++                }
++                if (moduli <= 0)
++                    return false;
++
++                const Entry* te = tw_entry_locked(st, r.table, r.modulus,
++                                                  r.q_single, moduli, s);
++                if (te == nullptr)
++                    return false;
++
++                KParams p;
++                p.tab = r.table;
++                p.tabs = te->dev;
++                p.tab_moduli = te->moduli;
++                p.modulus = r.modulus;
++                p.q_single = r.q_single;
++                p.ninv = nullptr;
++                p.ninvs = nullptr;
++                p.ninv_moduli = 0;
++                p.ninv_single = 0;
++                p.ninv_single_shoup = 0;
++                p.order = r.order;
++                p.order_mode = r.order_mode;
++                p.mod_count = r.mod_count;
++                p.stale = st.stale_dev;
++
++                if (!fwd)
++                {
++                    if (r.modulus != nullptr)
++                    {
++                        const Entry* ne = ninv_entry_locked(
++                            st, r.ninv, r.modulus, moduli, s);
++                        if (ne == nullptr)
++                            return false;
++                        p.ninv = r.ninv;
++                        p.ninvs = ne->dev;
++                        p.ninv_moduli = ne->moduli;
++                    }
++                    else
++                    {
++                        const u64 q = r.q_single;
++                        p.ninv_single = r.ninv_single % q;
++                        p.ninv_single_shoup =
++                            (u64) (((unsigned __int128) p.ninv_single << 64) /
++                                   q);
++                    }
++                }
++
++                const dim3 grid_col(32, r.batch);
++                const dim3 grid_tile(128 / TILES, r.batch);
++                const size_t smem_tile = TILES * TPAD * sizeof(u64);
++                if (fwd)
++                {
++                    fwd_col_kernel<<<grid_col, 256, 0, s>>>(r.in, r.out, p);
++                    fwd_tile_kernel<<<grid_tile, 64 * TILES, smem_tile, s>>>(
++                        r.out, p);
++                }
++                else
++                {
++                    inv_tile_kernel<<<grid_tile, 64 * TILES, smem_tile, s>>>(
++                        r.in, r.out, p);
++                    inv_col_kernel<<<grid_col, 256, 0, s>>>(r.out, p);
++                }
++                return true;
++            }
++
++        } // namespace
++
++        bool enabled()
++        {
++            const int o = g_override.load(std::memory_order_relaxed);
++            if (o >= 0)
++                return o != 0;
++            static const int env = []()
++            {
++                const char* e = std::getenv("GPUNTT_FAST16");
++                return e ? std::atoi(e) : 0;
++            }();
++            return env != 0;
++        }
++
++        void set_enabled(int value)
++        {
++            g_override.store(value < 0 ? -1 : (value != 0 ? 1 : 0),
++                             std::memory_order_relaxed);
++        }
++
++        void clear_cache()
++        {
++            State& st = state();
++            std::lock_guard<std::mutex> lk(st.mu);
++            drop_all_locked(st);
++            if (st.stale_host != nullptr)
++                *(volatile int*) st.stale_host = 0;
++        }
++
++        bool forward(const Request& request) { return run(request, true); }
++
++        bool inverse(const Request& request) { return run(request, false); }
++
++    } // namespace fast16
++} // namespace gpuntt

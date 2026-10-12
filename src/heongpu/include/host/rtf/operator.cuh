@@ -1347,6 +1347,67 @@ namespace heongpu
             const std::vector<int>& k_list,           // size B: which diagonals to pick
             cudaStream_t stream);
 
+        // out_ntt += sum_m slab[m] * packed_baby[j_of_m[m]]   (NTT domain,
+        // full Q). packed_baby: [babies][2][Q][N], slab: [M][Q][N],
+        // out_ntt: [2][Q][N]; all device pointers.
+        __host__ void accumulate_plain_products_ntt(const Data64* packed_baby,
+                                                    const Data64* slab,
+                                                    const int* j_of_m, int M,
+                                                    Data64* out_ntt,
+                                                    cudaStream_t stream);
+
+        // ---- Hoisted rotations (KEYSWITCHING_METHOD_I and _II) ----------
+        // HEonGPU key-switches c1 *before* the automorphism (the key of
+        // Galois element g switches from sigma_g^{-1}(s) to s, and the
+        // permutation is applied after ModDown), so the decomposition of c1
+        // -- digits, ModUp to QP, NTT -- does not depend on g. It is done
+        // once per input; each Galois element then costs one inner product
+        // with its own key, an INTT over QP and ModDown + automorphism.
+        // Every element needs an exact key (no power-of-two chaining).
+
+        // outputs[k] = rot_{shifts[k]}(input) (row rotations; shift 0 is a
+        // copy). Input in coefficient domain; outputs in coefficient domain.
+        __host__ void
+        rotate_rows_hoisted(Ciphertext<Scheme::RTF>& input,
+                            const std::vector<int>& shifts,
+                            std::vector<Ciphertext<Scheme::RTF>>& outputs,
+                            Galoiskey<Scheme::RTF>& galois_key,
+                            const ExecutionOptions& options =
+                                ExecutionOptions());
+
+        // Same for arbitrary Galois elements (column_galois_elt() included).
+        __host__ void
+        apply_galois_hoisted(Ciphertext<Scheme::RTF>& input,
+                             const std::vector<int>& galois_elts,
+                             std::vector<Ciphertext<Scheme::RTF>>& outputs,
+                             Galoiskey<Scheme::RTF>& galois_key,
+                             const ExecutionOptions& options =
+                                 ExecutionOptions());
+
+        // Raw form on device buffers: input [2][Q][N] (coefficient domain),
+        // outputs[k] [2][Q][N] (coefficient domain) for galois_elts[k].
+        // Outputs must not alias the input.
+        __host__ void apply_galois_hoisted_raw(
+            const Data64* input, const std::vector<int>& galois_elts,
+            const std::vector<Data64*>& outputs,
+            Galoiskey<Scheme::RTF>& galois_key, cudaStream_t stream);
+
+        // Galois element of a row rotation / of the column rotation.
+        __host__ int row_galois_elt(const Galoiskey<Scheme::RTF>& galois_key,
+                                    int shift) const;
+        __host__ int
+        column_galois_elt(const Galoiskey<Scheme::RTF>& galois_key) const;
+
+        // True if galois_key holds a key for exactly this element.
+        __host__ bool has_galois_key(const Galoiskey<Scheme::RTF>& galois_key,
+                                     int galois_elt) const;
+
+        // In-place forward / inverse NTT of `count` packed ciphertexts
+        // [count][2][Q][N].
+        __host__ void ntt_ciphertexts_inplace(Data64* data, int count,
+                                              bool forward,
+                                              cudaStream_t stream);
+
         __host__ Ciphertext<Scheme::RTF> multiply_matrix_bsgs(
             heongpu::Ciphertext<heongpu::Scheme::RTF>& cipher,
             const std::vector<std::vector<heongpu::DeviceVector<Data64>>>& matrix_groups,
@@ -1452,6 +1513,16 @@ namespace heongpu
                                           Ciphertext<Scheme::RTF>& output,
                                           Switchkey<Scheme::RTF>& switch_key,
                                           const cudaStream_t stream);
+
+        ///////////////////////////////////////////////////
+
+        // Device pointer to the key of galois_elt; a host-resident key is
+        // copied into `staged` (kept alive by the caller).
+        __host__ const Data64*
+        galois_key_device_ptr(Galoiskey<Scheme::RTF>& galois_key,
+                              int galois_elt,
+                              std::vector<DeviceVector<Data64>>& staged,
+                              cudaStream_t stream);
 
         ///////////////////////////////////////////////////
 

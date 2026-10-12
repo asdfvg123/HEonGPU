@@ -149,7 +149,7 @@ namespace heongpu
         {
             reg_q[i] =
                 OPERATOR_GPU_64::mult(in_baseq_Bsk[location_q + (i << n_power)],
-                                      plain_modulus.value, ibase[i]);
+                                      OPERATOR_GPU_64::reduce_forced(plain_modulus.value, ibase[i]), ibase[i]);
             reg_q[i] = OPERATOR_GPU_64::mult(
                 reg_q[i], inv_punctured_prod_mod_base_array[i], ibase[i]);
         }
@@ -160,7 +160,7 @@ namespace heongpu
         {
             reg_Bsk[i] = OPERATOR_GPU_64::mult(
                 in_baseq_Bsk[location_Bsk + (i << n_power)],
-                plain_modulus.value, obase[i]);
+                OPERATOR_GPU_64::reduce_forced(plain_modulus.value, obase[i]), obase[i]);
         }
 
         // for Bsk
@@ -281,17 +281,23 @@ namespace heongpu
         int block_y = blockIdx.y; // decomp_mod
 
         Data64 plain_reg = plain_in[idx];
+        // Lift m in [0, t) to its centred value mod q_i. plain_reg and the
+        // increment (-t mod q_i) are reduced first: with a prime smaller than
+        // t (e.g. the 22-bit prime of RtF "128af", t = 25 bits) they are not
+        // below q_i.
+        Data64 reg_mod = OPERATOR_GPU_64::reduce_forced(plain_reg,
+                                                        modulus[block_y]);
 
         if (plain_reg >= plain_upper_half_threshold)
         {
             output[idx + (block_y << n_power)] = OPERATOR_GPU_64::add(
-                plain_reg, plain_upper_half_increment[block_y],
+                reg_mod, plain_upper_half_increment[block_y],
                 modulus[block_y]); // plain_reg +
                                    // plain_upper_half_increment[block_y];
         }
         else
         {
-            output[idx + (block_y << n_power)] = plain_reg;
+            output[idx + (block_y << n_power)] = reg_mod;
         }
     }
 
@@ -325,6 +331,47 @@ namespace heongpu
 
         Data64 ct = in1[location_ct];
         Data64 pt = in2[location_pt];
+
+        ct = OPERATOR_GPU_64::mult(ct, pt, modulus[block_y]);
+        out[location_ct] = ct;
+    }
+
+    __global__ void
+    cipher_constant_plain_multiplication_kernel(Data64* in1, double in2,
+                                                Data64* out, Modulus64* modulus,
+                                                double two_pow_64, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+
+        double message_r = in2;
+
+        double coeff_double = round(message_r);
+        bool is_negative = signbit(coeff_double);
+        coeff_double = fabs(coeff_double);
+
+        // Change Type
+        Data64 coeff[2] = {
+            static_cast<std::uint64_t>(fmod(coeff_double, two_pow_64)),
+            static_cast<std::uint64_t>(coeff_double / two_pow_64)};
+
+        Data64 pt;
+        if (is_negative)
+        {
+            pt = reduce_exact_two_word(coeff, modulus[block_y]);
+            pt = OPERATOR_GPU_64::sub(modulus[block_y].value, pt,
+                                      modulus[block_y]);
+        }
+        else
+        {
+            pt = reduce_exact_two_word(coeff, modulus[block_y]);
+        }
+
+        Data64 ct = in1[location_ct];
 
         ct = OPERATOR_GPU_64::mult(ct, pt, modulus[block_y]);
         out[location_ct] = ct;
@@ -480,9 +527,9 @@ namespace heongpu
 
         const Data64 v = plains[b * N + idx];
 
-        Data64 w = v;
+        Data64 w = OPERATOR_GPU_64::reduce_forced(v, modulus[limb]);
         if (v >= upper_thresh)
-            w = OPERATOR_GPU_64::add(v, upper_inc[limb], modulus[limb]);
+            w = OPERATOR_GPU_64::add(w, upper_inc[limb], modulus[limb]);
 
         // limb-major layout: [limb][b][idx]
         out_rns[ ((size_t)limb * B + b) * N + idx ] = w;
@@ -560,12 +607,186 @@ namespace heongpu
         if (idx >= N || limb >= Q || b >= B) return;
 
         const int k = k_list[b];
-        Data64 v = base_plain[(size_t)k * N + idx];
+        const Data64 m = base_plain[(size_t)k * N + idx];
+        Data64 v = OPERATOR_GPU_64::reduce_forced(m, modulus[limb]);
 
-        if (v >= upper_thresh)
+        if (m >= upper_thresh)
             v = OPERATOR_GPU_64::add(v, upper_inc[limb], modulus[limb]);
 
         const int p = b * Q + limb; // poly index
         in_polyBQ_N[(size_t)p * N + idx] = v;
     }
+    __global__ void cipher_div_by_i_kernel(Data64* in1, Data64* out,
+                                           Data64* ntt_table,
+                                           Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+        int location_psi = 1 + (block_y << n_power);
+
+        Data64 ct = in1[location_ct];
+        Data64 psi = ntt_table[location_psi];
+
+        if (idx < (1 << (n_power - 1)))
+        {
+            Data64 zero = 0;
+            Data64 neg_psi = OPERATOR_GPU_64::sub(zero, psi, modulus[block_y]);
+            ct = OPERATOR_GPU_64::mult(ct, neg_psi, modulus[block_y]);
+        }
+        else
+        {
+            ct = OPERATOR_GPU_64::mult(ct, psi, modulus[block_y]);
+        }
+        out[location_ct] = ct;
+    }
+
+    __global__ void cipher_mult_by_i_kernel(Data64* in1, Data64* out,
+                                            Data64* ntt_table,
+                                            Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+        int location_psi = 1 + (block_y << n_power);
+
+        Data64 ct = in1[location_ct];
+        Data64 psi = ntt_table[location_psi];
+
+        if (idx < (1 << (n_power - 1)))
+        {
+            ct = OPERATOR_GPU_64::mult(ct, psi, modulus[block_y]);
+        }
+        else
+        {
+            Data64 zero = 0;
+            Data64 neg_psi = OPERATOR_GPU_64::sub(zero, psi, modulus[block_y]);
+            ct = OPERATOR_GPU_64::mult(ct, neg_psi, modulus[block_y]);
+        }
+        out[location_ct] = ct;
+    }
+
+    __global__ void cipher_mult_by_gaussian_integer_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* out,
+        Data64* ntt_table, Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+        int location_psi = 1 + (block_y << n_power);
+
+        Data64 ct = in1[location_ct];
+        Data64 psi = ntt_table[location_psi];
+
+        Data64 c_real = real_rns[block_y];
+        Data64 c_imag = imag_rns[block_y];
+
+        Data64 const_imag =
+            OPERATOR_GPU_64::mult(c_imag, psi, modulus[block_y]);
+
+        if (idx < (1 << (n_power - 1)))
+        {
+            Data64 scaled_const =
+                OPERATOR_GPU_64::add(c_real, const_imag, modulus[block_y]);
+            ct = OPERATOR_GPU_64::mult(ct, scaled_const, modulus[block_y]);
+        }
+        else
+        {
+            Data64 scaled_const =
+                OPERATOR_GPU_64::sub(c_real, const_imag, modulus[block_y]);
+            ct = OPERATOR_GPU_64::mult(ct, scaled_const, modulus[block_y]);
+        }
+        out[location_ct] = ct;
+    }
+
+    __global__ void cipher_add_by_gaussian_integer_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* out,
+        Data64* ntt_table, Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+        int location_psi = 1 + (block_y << n_power);
+
+        Data64 ct = in1[location_ct];
+        Data64 psi = ntt_table[location_psi];
+
+        Data64 c_real = real_rns[block_y];
+        Data64 c_imag = imag_rns[block_y];
+
+        Data64 const_imag =
+            OPERATOR_GPU_64::mult(c_imag, psi, modulus[block_y]);
+
+        if (block_z == 0)
+        {
+            if (idx < (1 << (n_power - 1)))
+            {
+                Data64 scaled_const =
+                    OPERATOR_GPU_64::add(c_real, const_imag, modulus[block_y]);
+                ct = OPERATOR_GPU_64::add(ct, scaled_const, modulus[block_y]);
+            }
+            else
+            {
+                Data64 scaled_const =
+                    OPERATOR_GPU_64::sub(c_real, const_imag, modulus[block_y]);
+                ct = OPERATOR_GPU_64::add(ct, scaled_const, modulus[block_y]);
+            }
+        }
+        out[location_ct] = ct;
+    }
+
+    __global__ void cipher_mult_by_gaussian_integer_and_add_kernel(
+        Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* accumulator,
+        Data64* ntt_table, Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int block_y = blockIdx.y; // rns count
+        int block_z = blockIdx.z; // cipher count (for ct0, ct1, etc.)
+
+        int location_ct =
+            idx + (block_y << n_power) + ((gridDim.y * block_z) << n_power);
+        int location_psi = 1 + (block_y << n_power);
+
+        Data64 ct = in1[location_ct];
+        Data64 acc = accumulator[location_ct];
+        Data64 psi = ntt_table[location_psi];
+
+        Data64 c_real = real_rns[block_y];
+        Data64 c_imag = imag_rns[block_y];
+
+        Data64 const_imag =
+            OPERATOR_GPU_64::mult(c_imag, psi, modulus[block_y]);
+
+        Data64 mult_result;
+        if (idx < (1 << (n_power - 1)))
+        {
+            Data64 scaled_const =
+                OPERATOR_GPU_64::add(c_real, const_imag, modulus[block_y]);
+            mult_result =
+                OPERATOR_GPU_64::mult(ct, scaled_const, modulus[block_y]);
+        }
+        else
+        {
+            Data64 scaled_const =
+                OPERATOR_GPU_64::sub(c_real, const_imag, modulus[block_y]);
+            mult_result =
+                OPERATOR_GPU_64::mult(ct, scaled_const, modulus[block_y]);
+        }
+
+        accumulator[location_ct] =
+            OPERATOR_GPU_64::add(acc, mult_result, modulus[block_y]);
+    }
+
 } // namespace heongpu

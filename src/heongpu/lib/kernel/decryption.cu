@@ -65,7 +65,9 @@ namespace heongpu
             Data64 gamma_ =
                 OPERATOR_GPU_64::reduce_forced(gamma.value, modulus[i]);
 
-            mt = OPERATOR_GPU_64::mult(mt, plain_mod.value, modulus[i]);
+            mt = OPERATOR_GPU_64::mult(
+                mt, OPERATOR_GPU_64::reduce_forced(plain_mod.value, modulus[i]),
+                modulus[i]);
 
             mt = OPERATOR_GPU_64::mult(mt, gamma_, modulus[i]);
 
@@ -139,7 +141,9 @@ namespace heongpu
             Data64 gamma_ =
                 OPERATOR_GPU_64::reduce_forced(gamma.value, modulus[i]);
 
-            mt = OPERATOR_GPU_64::mult(mt, plain_mod.value, modulus[i]);
+            mt = OPERATOR_GPU_64::mult(
+                mt, OPERATOR_GPU_64::reduce_forced(plain_mod.value, modulus[i]),
+                modulus[i]);
 
             mt = OPERATOR_GPU_64::mult(mt, gamma_, modulus[i]);
 
@@ -201,7 +205,10 @@ namespace heongpu
         Data64 ct_1 = input2[index];
 
         ct_0 = OPERATOR_GPU_64::add(ct_1, ct_0, modulus[block_y]);
-        ct_0 = OPERATOR_GPU_64::mult(ct_0, plain_mod.value, modulus[block_y]);
+        ct_0 = OPERATOR_GPU_64::mult(
+            ct_0,
+            OPERATOR_GPU_64::reduce_forced(plain_mod.value, modulus[block_y]),
+            modulus[block_y]);
 
         output[index] = ct_0;
     }
@@ -390,7 +397,9 @@ namespace heongpu
             Data64 gamma_ =
                 OPERATOR_GPU_64::reduce_forced(gamma.value, modulus[i]);
 
-            mt = OPERATOR_GPU_64::mult(mt, plain_mod.value, modulus[i]);
+            mt = OPERATOR_GPU_64::mult(
+                mt, OPERATOR_GPU_64::reduce_forced(plain_mod.value, modulus[i]),
+                modulus[i]);
 
             mt = OPERATOR_GPU_64::mult(mt, gamma_, modulus[i]);
 

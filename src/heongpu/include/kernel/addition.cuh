@@ -8,6 +8,7 @@
 
 #include <curand_kernel.h>
 #include "modular_arith.cuh"
+#include "reduction.cuh"
 
 namespace heongpu
 {
@@ -60,6 +61,20 @@ namespace heongpu
                                                  Data64* out,
                                                  Modulus64* modulus,
                                                  int n_power);
+
+    __global__ void addition_constant_plain_ckks_poly(Data64* in1, double in2,
+                                                      Data64* out,
+                                                      Modulus64* modulus,
+                                                      double two_pow_64,
+                                                      int n_power);
+
+    __global__ void
+    substraction_constant_plain_ckks_poly(Data64* in1, double in2, Data64* out,
+                                          Modulus64* modulus, double two_pow_64,
+                                          int n_power);
+
+    __global__ void set_zero_cipher_ckks_poly(Data64* in1, Modulus64* modulus,
+                                              int n_power);
 
 } // namespace heongpu
 

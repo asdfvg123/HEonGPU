@@ -192,14 +192,34 @@ namespace heongpu
     __host__ int HEDecryptor<Scheme::RTF>::noise_budget_calculation(
         Ciphertext<Scheme::RTF>& ciphertext, const ExecutionOptions& options)
     {
-        HostVector<Data64> max_norm_memory(n * Q_size_);
+        // Invariant noise budget as in SEAL: log2(Q) - log2(||t * (c0 + c1 s)
+        // mod Q||_inf) - 1, with Q the ciphertext modulus (P excluded).
+        //
+        // The previous version read the result of an asynchronous copy into
+        // pinned memory (HostVector) without synchronizing, so it saw zeros
+        // and returned log2(Q) + 57 or so; its block reduction also only
+        // looked at every 16th coefficient. The max-norm reduction is now
+        // done on the host over all N coefficients.
+        if (ciphertext.coeff_modulus_count() != Q_size_)
+        {
+            throw std::invalid_argument(
+                "noise budget needs a ciphertext at the full modulus Q");
+        }
+        if (ciphertext.in_ntt_domain())
+        {
+            throw std::invalid_argument(
+                "noise budget needs a ciphertext in coefficient form");
+        }
+
+        std::vector<Data64> composed(static_cast<size_t>(n) * Q_size_);
+        std::vector<Data64> threshold(Q_size_), modulus_big(Q_size_);
 
         input_storage_manager(
             ciphertext,
             [&](Ciphertext<Scheme::RTF>& ciphertext_)
             {
-                Data64* ct0 = ciphertext.data();
-                Data64* ct1 = ciphertext.data() + (Q_size_ << n_power);
+                Data64* ct0 = ciphertext_.data();
+                Data64* ct1 = ciphertext_.data() + (Q_size_ << n_power);
 
                 gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
                     .n_power = n_power,
@@ -236,6 +256,8 @@ namespace heongpu
                     modulus_->data(), n_power, Q_size_);
                 HEONGPU_CUDA_CHECK(cudaGetLastError());
 
+                // CRT composition: coefficient i becomes a Q_size-word
+                // integer in [0, Q), word j at temp[i + (j << n_power)].
                 compose_kernel<<<dim3((n >> 8), 1, 1), 256, 0,
                                  options.stream_>>>(
                     temp_memory.data(), temp_memory.data(), modulus_->data(),
@@ -243,25 +265,66 @@ namespace heongpu
                     Q_size_, n_power);
                 HEONGPU_CUDA_CHECK(cudaGetLastError());
 
-                find_max_norm_kernel<<<1, 512, sizeof(Data64) * 512,
-                                       options.stream_>>>(
-                    temp_memory.data(), temp_memory.data(),
-                    upper_half_threshold_->data(), decryption_modulus_->data(),
-                    Q_size_,
-                    n_power); // TODO: merge with above kernel if possible
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
-
-                cudaMemcpyAsync(max_norm_memory.data(), temp_memory.data(),
-                                Q_size_ * sizeof(Data64),
-                                cudaMemcpyDeviceToHost, options.stream_);
-                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    composed.data(), temp_memory.data(),
+                    composed.size() * sizeof(Data64), cudaMemcpyDeviceToHost,
+                    options.stream_));
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    threshold.data(), upper_half_threshold_->data(),
+                    Q_size_ * sizeof(Data64), cudaMemcpyDeviceToHost,
+                    options.stream_));
+                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                    modulus_big.data(), decryption_modulus_->data(),
+                    Q_size_ * sizeof(Data64), cudaMemcpyDeviceToHost,
+                    options.stream_));
+                HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
             },
             options, false);
 
-        return total_bit_count_ -
-               calculate_big_integer_bit_count(max_norm_memory.data(),
-                                               Q_size_) -
-               1;
+        // Little-endian multiword compare / subtract.
+        auto compare = [&](const Data64* a, const Data64* b) -> int
+        {
+            for (int w = Q_size_ - 1; w >= 0; --w)
+            {
+                if (a[w] != b[w])
+                    return (a[w] > b[w]) ? 1 : -1;
+            }
+            return 0;
+        };
+
+        std::vector<Data64> value(Q_size_), max_norm(Q_size_, 0);
+        for (int i = 0; i < n; ++i)
+        {
+            for (int w = 0; w < Q_size_; ++w)
+                value[w] = composed[i + (static_cast<size_t>(w) << n_power)];
+            if (compare(value.data(), threshold.data()) >= 0)
+            {
+                // |value| = Q - value
+                unsigned __int128 borrow = 0;
+                for (int w = 0; w < Q_size_; ++w)
+                {
+                    unsigned __int128 d =
+                        (unsigned __int128) modulus_big[w] - value[w] - borrow;
+                    value[w] = static_cast<Data64>(d);
+                    borrow = (d >> 64) ? 1 : 0;
+                }
+            }
+            if (compare(value.data(), max_norm.data()) > 0)
+                max_norm = value;
+        }
+
+        int norm_bits = 0;
+        for (int w = Q_size_ - 1; w >= 0; --w)
+        {
+            if (max_norm[w] != 0)
+            {
+                norm_bits = 64 * w + (64 - __builtin_clzll(max_norm[w]));
+                break;
+            }
+        }
+
+        const int budget = total_bit_count_ - norm_bits - 1;
+        return (budget > 0) ? budget : 0;
     }
 
 } // namespace heongpu

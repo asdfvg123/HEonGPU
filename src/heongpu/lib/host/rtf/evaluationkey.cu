@@ -659,6 +659,11 @@ namespace heongpu
 
     void Galoiskey<Scheme::RTF>::load(std::istream& is)
     {
+        load(is, storage_type::DEVICE);
+    }
+
+    void Galoiskey<Scheme::RTF>::load(std::istream& is, storage_type target)
+    {
         if ((!galois_key_generated_))
         {
             is.read((char*) &scheme_, sizeof(scheme_));
@@ -687,7 +692,7 @@ namespace heongpu
             is.read((char*) &galois_key_generated_,
                     sizeof(galois_key_generated_));
 
-            storage_type_ = storage_type::DEVICE;
+            storage_type_ = target;
             galois_key_generated_ = true;
 
             if (customized)
@@ -727,21 +732,40 @@ namespace heongpu
                 HostVector<Data64> host_locations_temp(galoiskey_size_);
                 is.read((char*) host_locations_temp.data(),
                         sizeof(Data64) * galoiskey_size_);
-                device_location_[first] =
-                    DeviceVector<Data64>(host_locations_temp);
-                cudaDeviceSynchronize();
+                if (target == storage_type::DEVICE)
+                {
+                    device_location_[first] =
+                        DeviceVector<Data64>(host_locations_temp);
+                    cudaDeviceSynchronize();
+                }
+                else
+                {
+                    host_location_[first] = std::move(host_locations_temp);
+                }
             }
 
             HostVector<Data64> host_locations_temp(galoiskey_size_);
             is.read((char*) host_locations_temp.data(),
                     sizeof(Data64) * galoiskey_size_);
 
-            zero_device_location_.resize(galoiskey_size_);
-            cudaMemcpy(zero_device_location_.data(), host_locations_temp.data(),
-                       galoiskey_size_ * sizeof(Data64),
-                       cudaMemcpyHostToDevice);
-            HEONGPU_CUDA_CHECK(cudaGetLastError());
-            cudaDeviceSynchronize();
+            if (target == storage_type::DEVICE)
+            {
+                zero_device_location_.resize(galoiskey_size_);
+                cudaMemcpy(zero_device_location_.data(),
+                           host_locations_temp.data(),
+                           galoiskey_size_ * sizeof(Data64),
+                           cudaMemcpyHostToDevice);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+                cudaDeviceSynchronize();
+            }
+            else
+            {
+                zero_host_location_ = std::move(host_locations_temp);
+            }
+            if (!is)
+            {
+                throw std::runtime_error("Galoiskey::load: truncated input!");
+            }
         }
         else
         {

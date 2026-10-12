@@ -70,8 +70,11 @@ namespace heongpu
             fix = int(fix / plain_mod.value);
 
             Data64 result = OPERATOR_GPU_64::mult(
-                message, coeffdiv_plain[block_y], modulus[block_y]);
-            result = OPERATOR_GPU_64::add(result, fix, modulus[block_y]);
+                OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),
+                coeffdiv_plain[block_y], modulus[block_y]);
+            result = OPERATOR_GPU_64::add(
+                result, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
             result = OPERATOR_GPU_64::add(result, ciphertext, modulus[block_y]);
 
@@ -101,9 +104,11 @@ namespace heongpu
         fix = fix + upper_threshold;
         fix = int(fix / plain_mod.value);
 
-        Data64 result = OPERATOR_GPU_64::mult(message, coeffdiv_plain[block_y],
+        Data64 result = OPERATOR_GPU_64::mult(OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),coeffdiv_plain[block_y],
                                               modulus[block_y]);
-        result = OPERATOR_GPU_64::add(result, fix, modulus[block_y]);
+        result = OPERATOR_GPU_64::add(
+                result, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
         result = OPERATOR_GPU_64::add(result, ciphertext, modulus[block_y]);
 
@@ -132,8 +137,11 @@ namespace heongpu
             fix = int(fix / plain_mod.value);
 
             Data64 result = OPERATOR_GPU_64::mult(
-                message, coeffdiv_plain[block_y], modulus[block_y]);
-            result = OPERATOR_GPU_64::add(result, fix, modulus[block_y]);
+                OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),
+                coeffdiv_plain[block_y], modulus[block_y]);
+            result = OPERATOR_GPU_64::add(
+                result, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
             result = OPERATOR_GPU_64::sub(ciphertext, result, modulus[block_y]);
 
@@ -163,9 +171,11 @@ namespace heongpu
         fix = fix + upper_threshold;
         fix = int(fix / plain_mod.value);
 
-        Data64 result = OPERATOR_GPU_64::mult(message, coeffdiv_plain[block_y],
+        Data64 result = OPERATOR_GPU_64::mult(OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),coeffdiv_plain[block_y],
                                               modulus[block_y]);
-        result = OPERATOR_GPU_64::add(result, fix, modulus[block_y]);
+        result = OPERATOR_GPU_64::add(
+                result, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
         result = OPERATOR_GPU_64::sub(ciphertext, result, modulus[block_y]);
 
@@ -189,7 +199,6 @@ namespace heongpu
         }
         else
         {
-            // out[location] = in1[location];
             Data64 ciphertext = in1[location];
             out[location] = ciphertext;
         }
@@ -215,6 +224,108 @@ namespace heongpu
         {
             out[location] = in1[location];
         }
+    }
+
+    __global__ void addition_constant_plain_ckks_poly(Data64* in1, double in2,
+                                                      Data64* out,
+                                                      Modulus64* modulus,
+                                                      double two_pow_64,
+                                                      int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int idy = blockIdx.y; // rns count
+        int idz = blockIdx.z; // cipher count
+
+        int location = idx + (idy << n_power) + ((gridDim.y * idz) << n_power);
+
+        if (idz == 0)
+        {
+            double message_r = in2;
+
+            double coeff_double = round(message_r);
+            bool is_negative = signbit(coeff_double);
+            coeff_double = fabs(coeff_double);
+
+            // Change Type
+            Data64 coeff[2] = {
+                static_cast<std::uint64_t>(fmod(coeff_double, two_pow_64)),
+                static_cast<std::uint64_t>(coeff_double / two_pow_64)};
+
+            Data64 pt;
+            if (is_negative)
+            {
+                pt = reduce_exact_two_word(coeff, modulus[idy]);
+                pt = OPERATOR_GPU_64::sub(modulus[idy].value, pt, modulus[idy]);
+            }
+            else
+            {
+                pt = reduce_exact_two_word(coeff, modulus[idy]);
+            }
+
+            out[location] =
+                OPERATOR_GPU_64::add(in1[location], pt, modulus[idy]);
+        }
+        else
+        {
+            Data64 ciphertext = in1[location];
+            out[location] = ciphertext;
+        }
+    }
+
+    __global__ void
+    substraction_constant_plain_ckks_poly(Data64* in1, double in2, Data64* out,
+                                          Modulus64* modulus, double two_pow_64,
+                                          int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int idy = blockIdx.y; // rns count
+        int idz = blockIdx.z; // cipher count
+
+        int location = idx + (idy << n_power) + ((gridDim.y * idz) << n_power);
+
+        if (idz == 0)
+        {
+            double message_r = in2;
+
+            double coeff_double = round(message_r);
+            bool is_negative = signbit(coeff_double);
+            coeff_double = fabs(coeff_double);
+
+            // Change Type
+            Data64 coeff[2] = {
+                static_cast<std::uint64_t>(fmod(coeff_double, two_pow_64)),
+                static_cast<std::uint64_t>(coeff_double / two_pow_64)};
+
+            Data64 pt;
+            if (is_negative)
+            {
+                pt = reduce_exact_two_word(coeff, modulus[idy]);
+                pt = OPERATOR_GPU_64::sub(modulus[idy].value, pt, modulus[idy]);
+            }
+            else
+            {
+                pt = reduce_exact_two_word(coeff, modulus[idy]);
+            }
+
+            out[location] =
+                OPERATOR_GPU_64::sub(in1[location], pt, modulus[idy]);
+        }
+        else
+        {
+            out[location] = in1[location];
+        }
+    }
+
+    __global__ void set_zero_cipher_ckks_poly(Data64* in1, Modulus64* modulus,
+                                              int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int idy = blockIdx.y; // rns count
+        int idz = blockIdx.z; // cipher count
+
+        int location = idx + (idy << n_power) + ((gridDim.y * idz) << n_power);
+
+        in1[location] = 0;
     }
 
 } // namespace heongpu

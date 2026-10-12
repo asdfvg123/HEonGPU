@@ -495,8 +495,11 @@ namespace heongpu
             std::vector<Data64> plain_upper_half_increment;
             for (int i = 0; i < Q_size; i++)
             {
-                plain_upper_half_increment.push_back(prime_vector_[i].value -
-                                                     plain_mod.value);
+                // -t mod q_i (q_i may be smaller than t).
+                plain_upper_half_increment.push_back(
+                    (prime_vector_[i].value -
+                     plain_mod.value % prime_vector_[i].value) %
+                    prime_vector_[i].value);
             }
 
             Modulus64 m_tilde((1ULL << 32));
@@ -705,8 +708,12 @@ namespace heongpu
                     break;
                 case 2: // KEYSWITCHING_METHOD_II
                 {
+                    // Hybrid key switching with |P| primes per digit:
+                    // dnum = ceil(|Q| / |P|), as in Lattigo / the RtF
+                    // reference (alpha = |P|).
                     KeySwitchParameterGenerator pool(n, base_q, P_size, scheme_,
-                                                     keyswitching_type_);
+                                                     keyswitching_type_,
+                                                     P_size);
 
                     m = pool.m;
                     l = pool.first_Q_;
@@ -745,8 +752,12 @@ namespace heongpu
                 break;
                 case 3: // KEYSWITCHING_METHOD_III
                 {
+                    // Hybrid key switching with |P| primes per digit:
+                    // dnum = ceil(|Q| / |P|), as in Lattigo / the RtF
+                    // reference (alpha = |P|).
                     KeySwitchParameterGenerator pool(n, base_q, P_size, scheme_,
-                                                     keyswitching_type_);
+                                                     keyswitching_type_,
+                                                     P_size);
 
                     m = pool.m;
                     l = pool.first_Q_;
@@ -1011,7 +1022,7 @@ namespace heongpu
         for (int i = 0; i < size; i++)
         {
             Data64 inner_prime = primes[i].value % plain_mod.value;
-            result = OPERATOR64::mult(result, inner_prime, plain_mod);
+            result = mult_mod_exact(result, inner_prime, plain_mod);
         }
 
         return result;
@@ -1069,7 +1080,7 @@ namespace heongpu
                     if (i != j)
                     {
                         temp =
-                            OPERATOR64::mult(temp, primes[j].value, bsk_mod[k]);
+                            mult_mod_exact(temp, primes[j].value, bsk_mod[k]);
                     }
                 }
                 base_matrix_q_Bsk.push_back(temp);
@@ -1092,7 +1103,7 @@ namespace heongpu
                 if (i != j)
                 {
                     Data64 base = primes[j].value % mtilda.value;
-                    temp = OPERATOR64::mult(temp, base, mtilda);
+                    temp = mult_mod_exact(temp, base, mtilda);
                 }
             }
             base_change_matrix_m_tilde.push_back(temp);
@@ -1109,7 +1120,7 @@ namespace heongpu
         {
             Data64 base = primes[i].value % mtilda.value;
             inv_prod_q_mod_m_tilde =
-                OPERATOR64::mult(inv_prod_q_mod_m_tilde, base, mtilda);
+                mult_mod_exact(inv_prod_q_mod_m_tilde, base, mtilda);
         }
 
         inv_prod_q_mod_m_tilde =
@@ -1140,7 +1151,7 @@ namespace heongpu
             Data64 temp = 1;
             for (int j = 0; j < size; j++)
             {
-                temp = OPERATOR64::mult(temp, primes[j].value, bsk_mod[i]);
+                temp = mult_mod_exact(temp, primes[j].value, bsk_mod[i]);
             }
             prod_q_mod_Bsk.push_back(temp);
         }
@@ -1157,7 +1168,7 @@ namespace heongpu
             Data64 temp = 1;
             for (int j = 0; j < size; j++)
             {
-                temp = OPERATOR64::mult(temp, primes[j].value, bsk_mod[i]);
+                temp = mult_mod_exact(temp, primes[j].value, bsk_mod[i]);
             }
             inv_prod_q_mod_Bsk.push_back(OPERATOR64::modinv(temp, bsk_mod[i]));
         }
@@ -1179,7 +1190,7 @@ namespace heongpu
                     if (i != j)
                     {
                         Data64 base = bsk_mod[j].value % primes[k].value;
-                        temp = OPERATOR64::mult(temp, base, primes[k]);
+                        temp = mult_mod_exact(temp, base, primes[k]);
                     }
                 }
                 base_matrix_Bsk_q.push_back(temp);
@@ -1200,7 +1211,7 @@ namespace heongpu
             {
                 if (i != j)
                 {
-                    temp = OPERATOR64::mult(temp, bsk_mod[j].value,
+                    temp = mult_mod_exact(temp, bsk_mod[j].value,
                                             bsk_mod[bsk_mod.size() - 1]);
                 }
             }
@@ -1222,7 +1233,7 @@ namespace heongpu
             {
                 if (i != j)
                 {
-                    temp = OPERATOR64::mult(temp, bsk_mod[j].value, bsk_mod[i]);
+                    temp = mult_mod_exact(temp, bsk_mod[j].value, bsk_mod[i]);
                 }
             }
             inv_punctured_prod_mod_B_array.push_back(
@@ -1239,7 +1250,7 @@ namespace heongpu
         for (int i = 0; i < bsk_mod.size() - 1; i++)
         {
             inv_prod_B_mod_m_sk =
-                OPERATOR64::mult(inv_prod_B_mod_m_sk, bsk_mod[i].value,
+                mult_mod_exact(inv_prod_B_mod_m_sk, bsk_mod[i].value,
                                  bsk_mod[bsk_mod.size() - 1]);
         }
 
@@ -1259,7 +1270,7 @@ namespace heongpu
             for (int j = 0; j < bsk_mod.size() - 1; j++)
             {
                 Data64 base = bsk_mod[j].value % primes[i].value;
-                temp = OPERATOR64::mult(temp, base, primes[i]);
+                temp = mult_mod_exact(temp, base, primes[i]);
             }
             prod_B_mod_q.push_back(temp);
         }
@@ -1313,7 +1324,7 @@ namespace heongpu
                 if (i != j)
                 {
                     Data64 mod_ = primes[j].value % plain_mod.value;
-                    temp = OPERATOR64::mult(temp, mod_, plain_mod);
+                    temp = mult_mod_exact(temp, mod_, plain_mod);
                 }
             }
             Qi_t.push_back(temp);
@@ -1335,7 +1346,7 @@ namespace heongpu
                 if (i != j)
                 {
                     Data64 mod = primes[j].value % gamma.value;
-                    temp = OPERATOR64::mult(temp, mod, gamma);
+                    temp = mult_mod_exact(temp, mod, gamma);
                 }
             }
             Qi_gamma.push_back(temp);
@@ -1358,7 +1369,7 @@ namespace heongpu
                 {
                     Data64 mod_ = primes[j].value % primes[i].value;
                     Data64 inv_ = OPERATOR64::modinv(mod_, primes[i]);
-                    temp = OPERATOR64::mult(temp, inv_, primes[i]);
+                    temp = mult_mod_exact(temp, inv_, primes[i]);
                 }
             }
             Qi_inverse.push_back(temp);
@@ -1376,7 +1387,7 @@ namespace heongpu
         {
             Data64 mod_ = primes[i].value % plain_mod.value;
             Data64 inv_ = OPERATOR64::modinv(mod_, plain_mod);
-            mulq_inv_t = OPERATOR64::mult(mulq_inv_t, inv_, plain_mod);
+            mulq_inv_t = mult_mod_exact(mulq_inv_t, inv_, plain_mod);
         }
 
         mulq_inv_t = plain_mod.value - mulq_inv_t;
@@ -1392,7 +1403,7 @@ namespace heongpu
         {
             Data64 mod_ = primes[i].value % gamma.value;
             Data64 inv_ = OPERATOR64::modinv(mod_, gamma);
-            mulq_inv_gamma = OPERATOR64::mult(mulq_inv_gamma, inv_, gamma);
+            mulq_inv_gamma = mult_mod_exact(mulq_inv_gamma, inv_, gamma);
         }
 
         mulq_inv_gamma = gamma.value - mulq_inv_gamma;

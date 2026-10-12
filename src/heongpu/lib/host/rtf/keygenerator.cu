@@ -107,6 +107,72 @@ namespace heongpu
             options, true);
     }
 
+    __host__ void HEKeyGenerator<Scheme::RTF>::generate_secret_key_v2(
+        Secretkey<Scheme::RTF>& sk, const ExecutionOptions& options)
+    {
+        if (sk.secret_key_generated_)
+        {
+            throw std::logic_error("Secretkey is already generated!");
+        }
+
+        input_storage_manager(
+            sk,
+            [&](Secretkey<Scheme::RTF>& sk_)
+            {
+                // Exactly h distinct positions (partial Fisher-Yates), each
+                // set to -1 or +1. The dense key is built on the host and
+                // uploaded: secretkey_gen_kernel_v2 zeroes the key and writes
+                // the nonzeros in different blocks without a grid-wide
+                // barrier, which can wipe nonzeros at N = 2^16.
+                std::vector<int> secret_key_host(n, 0);
+                std::vector<int> index(n);
+                for (int i = 0; i < n; i++)
+                {
+                    index[i] = i;
+                }
+                std::mt19937 rng(seed_);
+                for (int i = 0; i < sk_.hamming_weight_; i++)
+                {
+                    std::uniform_int_distribution<int> dist(i, n - 1);
+                    int j = dist(rng);
+                    std::swap(index[i], index[j]);
+                    std::uniform_int_distribution<int> value_dist(0, 1);
+                    secret_key_host[index[i]] =
+                        (value_dist(rng) == 0) ? -1 : 1;
+                }
+
+                DeviceVector<int> secret_key_without_rns(secret_key_host,
+                                                         options.stream_);
+
+                DeviceVector<Data64> secret_key_rns(
+                    (sk_.coeff_modulus_count() * n), options.stream_);
+
+                secretkey_rns_kernel<<<dim3((n >> 8), 1, 1), 256, 0,
+                                       options.stream_>>>(
+                    secret_key_without_rns.data(), secret_key_rns.data(),
+                    modulus_->data(), n_power, Q_prime_size_);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+                gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+                    .n_power = n_power,
+                    .ntt_type = gpuntt::FORWARD,
+                    .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+                    .zero_padding = false,
+                    .stream = options.stream_};
+
+                gpuntt::GPU_NTT_Inplace(secret_key_rns.data(),
+                                        ntt_table_->data(), modulus_->data(),
+                                        cfg_ntt, Q_prime_size_, Q_prime_size_);
+                HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+                sk_.in_ntt_domain_ = true;
+                sk_.secret_key_generated_ = true;
+
+                sk_.memory_set(std::move(secret_key_rns));
+            },
+            options, true);
+    }
+
     __host__ void HEKeyGenerator<Scheme::RTF>::generate_public_key(
         Publickey<Scheme::RTF>& pk, Secretkey<Scheme::RTF>& sk,
         const ExecutionOptions& options)

@@ -28,19 +28,30 @@ target_include_directories(
     heongpu
     PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/host>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/host/ckks>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/kernel>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/util>
     $<INSTALL_INTERFACE:include/HEonGPU-${PROJECT_VERSION}>
 )
 
+# NTL (used by the v2 bootstrapping's high-precision cosine approximation):
+# pass -D NTL_ROOT=<prefix> or set $NTL_ROOT when it is not a system package.
+set(NTL_ROOT "$ENV{NTL_ROOT}" CACHE PATH "NTL install prefix")
+if(NTL_ROOT)
+    target_include_directories(heongpu PUBLIC $<BUILD_INTERFACE:${NTL_ROOT}/include>)
+    target_link_directories(heongpu PUBLIC ${NTL_ROOT}/lib)
+endif()
+
 target_link_libraries(heongpu PUBLIC 
     ntt
     fft
     rngongpu
+    ntl
     gmp
     rmm
     CUDA::curand
     ZLIB::ZLIB
+    OpenSSL::Crypto
 )
 
 set_target_properties(heongpu PROPERTIES

@@ -37,6 +37,11 @@ set(EXECUTABLES
     ckks_rotation_method_2_testcases test_ckks_rotation_method_2.cu
 
     tfhe_gate_boot_testcases test_tfhe_gate_boot.cu
+
+    ntt_fast16_testcases test_ntt_fast16.cu
+
+    modular_arith_testcases test_modular_arith.cu
+    bfv_rtf_decryption_testcases test_bfv_rtf_decryption.cu
 )
 
 function(add_test exe source)
@@ -47,7 +52,11 @@ function(add_test exe source)
         POSITION_INDEPENDENT_CODE ON
         CUDA_RUNTIME_LIBRARY Static
     )
+    # Discover at ctest time, not as a post-build step: a post-build run of
+    # every test binary under a parallel build easily exceeds the 5 s
+    # discovery timeout, and must not touch a GPU other jobs are using.
     gtest_discover_tests(${exe}
+        DISCOVERY_MODE PRE_TEST
         PROPERTIES
           LABELS "unit"
           TIMEOUT 30

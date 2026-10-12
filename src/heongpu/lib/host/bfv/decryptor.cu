@@ -198,8 +198,8 @@ namespace heongpu
             ciphertext,
             [&](Ciphertext<Scheme::BFV>& ciphertext_)
             {
-                Data64* ct0 = ciphertext.data();
-                Data64* ct1 = ciphertext.data() + (Q_size_ << n_power);
+                Data64* ct0 = ciphertext_.data();
+                Data64* ct1 = ciphertext_.data() + (Q_size_ << n_power);
 
                 gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
                     .n_power = n_power,
@@ -255,6 +255,9 @@ namespace heongpu
                                 Q_size_ * sizeof(Data64),
                                 cudaMemcpyDeviceToHost, options.stream_);
                 HEONGPU_CUDA_CHECK(cudaGetLastError());
+                // max_norm_memory is pinned, so the copy is asynchronous:
+                // wait for it before reading the norm on the host.
+                HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
             },
             options, false);
 

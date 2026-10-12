@@ -65,6 +65,10 @@ class MemoryPool
     size_t get_current_host_pool_memory_usage() const;
     size_t get_free_host_pool_memory() const;
 
+    // High-water marks of the bytes handed out by the pools.
+    size_t get_peak_device_pool_memory_usage() const;
+    size_t get_peak_host_pool_memory_usage() const;
+
     ~MemoryPool();
 
   private:

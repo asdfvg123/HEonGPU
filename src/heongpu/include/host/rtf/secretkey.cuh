@@ -89,6 +89,15 @@ namespace heongpu
         Data64* data();
 
         /**
+         * @brief Recovers the ternary coefficients of the secret (from its
+         * residue mod q0), e.g. to build the same key for a context whose
+         * moduli are a prefix of this one's (Secretkey(vector, context)).
+         */
+        __host__ std::vector<int> ternary(HEContext<Scheme::RTF>& context,
+                                          cudaStream_t stream =
+                                              cudaStreamDefault);
+
+        /**
          * @brief Switches the secretkey CUDA stream.
          *
          * @param stream The new CUDA stream to be used.

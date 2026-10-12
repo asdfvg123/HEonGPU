@@ -21,3 +21,17 @@ The basic example directory in the HEonGPU repository contains sample programs t
 - [8_basic_bfv_logic.cu](8_basic_bfv_logic.cu): Demonstrates basic logic operations on encrypted binarys using the BFV scheme, including encryption, evaluation, and decryption.
 
 - [9_basic_ckks_logic.cu](9_basic_ckks_logic.cu): Demonstrates basic logic operations on encrypted binarys using the CKKS scheme, including encryption, evaluation, and decryption.
+
+### RtF / Rubato (Scheme::RTF)
+
+Each of these prints `[PASS]` / `[FAIL]` checks against a plaintext reference and exits non-zero on failure.
+
+- [13_basic_rtf_matmul.cu](13_basic_rtf_matmul.cu): Diagonal matrix-vector product on FV slots with `multiply_matrix`.
+
+- [15_rtf_fv_slot2coeff.cu](15_rtf_fv_slot2coeff.cu): SlotToCoeff_FV (`HEHERA::S2C_FV`) on a random vector; `[logN] [keyswitching method 1|2]`, default METHOD_II.
+
+- [16_rtf_matmul_bsgs.cu](16_rtf_matmul_bsgs.cu): Baby-step giant-step product (`multiply_matrix_bsgs`) for a sparse matrix, with its calling convention (groups, pre-rotated diagonals, keys).
+
+- [18_rtf_moddown.cu](18_rtf_moddown.cu): FV mod-down to q0 (`HEHERA::moddown_FV_inplace`), decrypted on the host with a known secret key and checked coefficient by coefficient.
+
+- [19_rtf_rubato.cu](19_rtf_rubato.cu): The full RtF transciphering flow with Rubato Par-128L: homomorphic keystream vs host reference, SlotToCoeff_FV, HalfBoot output vs client messages, and server timing.

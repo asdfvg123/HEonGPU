@@ -8,6 +8,7 @@
 
 #include <curand_kernel.h>
 #include "modular_arith.cuh"
+#include "reduction.cuh"
 #include "complex.cuh"
 #include "bigintegerarith.cuh"
 

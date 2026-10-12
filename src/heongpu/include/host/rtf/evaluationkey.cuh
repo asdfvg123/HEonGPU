@@ -664,6 +664,10 @@ namespace heongpu
 
         void load(std::istream& is);
 
+        // Same, keeping the keys in the given storage (HOST keeps the
+        // Galois keys in pinned host memory, e.g. the S2C giant steps).
+        void load(std::istream& is, storage_type target);
+
 
         inline bool has_device_elt(int galois_elt) const {
             return (device_location_.find(galois_elt) != device_location_.end());

@@ -19,11 +19,11 @@ set(EXECUTABLES
     11_ckks_serialization 11_ckks_serialization.cu
     12_basic_tfhe 12_basic_tfhe.cu
     13_basic_rtf_matmul 13_basic_rtf_matmul.cu
-    14_rtf_hera 14_rtf_hera.cu
     15_rtf_fv_slot2coeff 15_rtf_fv_slot2coeff.cu
     16_rtf_matmul_bsgs 16_rtf_matmul_bsgs.cu
-    17_rtf_transcipher 17_rtf_transcipher.cu
     18_rtf_moddown 18_rtf_moddown.cu
+    19_rtf_rubato 19_rtf_rubato.cu
+    20_rtf_s2c_fft 20_rtf_s2c_fft.cu
 )
 
 function(add_example exe source)

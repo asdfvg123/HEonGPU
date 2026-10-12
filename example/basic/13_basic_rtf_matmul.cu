@@ -1,45 +1,58 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
 // SPDX-License-Identifier: Apache-2.0
-// Developer: Alişah Özcan
+
+// Diagonal (Halevi-Shoup) matrix-vector product on RTF (FV) slots with
+// HEArithmeticOperator<RTF>::multiply_matrix, checked against the plaintext
+// product.
+//
+// The 2 x (N/2) slot matrix is treated as two independent rows. For every
+// diagonal k with rotation r_k:
+//     result[i] = sum_k diag_k[i] * v[row(i) + (col(i) + r_k) mod N/2]
+// (rotate_rows by r > 0 moves slot i + r to slot i). multiply_matrix
+// decomposes each r_k into signed powers of two, so the Galois key only needs
+// the power-of-two rotations.
 
 #include "heongpu.cuh"
 #include "../example_util.h"
-#include <omp.h>
 
-// These examples have been developed with reference to the Microsoft SEAL
-// library.
+#include <cstdint>
+#include <iostream>
+#include <random>
+#include <vector>
 
-// Set up HE Scheme
 constexpr auto Scheme = heongpu::Scheme::RTF;
+
 int main(int argc, char* argv[])
 {
     cudaSetDevice(0);
 
     heongpu::HEContext<Scheme> context(
         heongpu::keyswitching_type::KEYSWITCHING_METHOD_I);
-
-    size_t poly_modulus_degree = 4096;
-    context.set_poly_modulus_degree(poly_modulus_degree);
-
+    const size_t N = 4096;
+    context.set_poly_modulus_degree(N);
     context.set_coeff_modulus_default_values(1);
-
-    int plain_modulus = 786433;
-    context.set_plain_modulus(plain_modulus);
-
+    const uint64_t t = 786433;
+    context.set_plain_modulus(t);
     context.generate();
     context.print_parameters();
+
+    const int H = static_cast<int>(N / 2);
 
     heongpu::HEKeyGenerator<Scheme> keygen(context);
     heongpu::Secretkey<Scheme> secret_key(context);
     keygen.generate_secret_key(secret_key);
-
     heongpu::Publickey<Scheme> public_key(context);
     keygen.generate_public_key(public_key, secret_key);
 
-    heongpu::Relinkey<Scheme> relin_key(context);
-    keygen.generate_relin_key(relin_key, secret_key);
-
-    heongpu::Galoiskey<Scheme> galois_key(context);
+    // Signed powers of two below N/2 (the default Galoiskey would also try
+    // 2^11 .. 2^15, which do not exist for N = 4096).
+    std::vector<int> pow2_shifts;
+    for (int s = 1; s < H; s <<= 1)
+    {
+        pow2_shifts.push_back(s);
+        pow2_shifts.push_back(-s);
+    }
+    heongpu::Galoiskey<Scheme> galois_key(context, pow2_shifts);
     keygen.generate_galois_key(galois_key, secret_key);
 
     heongpu::HEEncoder<Scheme> encoder(context);
@@ -47,76 +60,78 @@ int main(int argc, char* argv[])
     heongpu::HEDecryptor<Scheme> decryptor(context, secret_key);
     heongpu::HEArithmeticOperator<Scheme> operators(context, encoder);
 
-    std::vector<uint64_t> message(poly_modulus_degree, 0ULL);
-    message[0] = 1ULL;
-    message[1] = 2ULL;
-    message[2] = 3ULL;
-    message[3] = 4ULL;
-
-    display_matrix(message, 0);
+    std::mt19937_64 rng(13);
+    std::vector<uint64_t> message(N);
+    for (auto& v : message)
+        v = rng() % t;
 
     heongpu::Plaintext<Scheme> P1(context);
     encoder.encode(P1, message);
-
-    std::cout << "Encrypting plaintext matrix..." << std::endl;
     heongpu::Ciphertext<Scheme> C1(context);
     encryptor.encrypt(C1, P1);
+    std::cout << "Initial noise budget: " << decryptor.remainder_noise_budget(C1)
+              << " bits" << std::endl;
 
-    std::cout << "Initial noise budget in C1: "
-              << decryptor.remainder_noise_budget(C1) << " bits"
+    // Diagonals: small, negative, wrapping and non-power-of-two rotations.
+    std::vector<std::vector<int>> diags = {{0, 2, -2, 7, -100, 1000, H - 1}};
+    const size_t D = diags[0].size();
+    std::vector<std::vector<uint64_t>> diag_values(D, std::vector<uint64_t>(N));
+    for (auto& d : diag_values)
+        for (auto& v : d)
+            v = rng() % t;
+
+    // multiply_matrix takes the encoded diagonals of a group concatenated in
+    // one device buffer (N plaintext words per diagonal).
+    heongpu::DeviceVector<Data64> concatenated(D * N);
+    for (size_t k = 0; k < D; ++k)
+    {
+        heongpu::Plaintext<Scheme> pt(context);
+        encoder.encode(pt, diag_values[k]);
+        cudaMemcpy(concatenated.data() + k * N, pt.data(), N * sizeof(Data64),
+                   cudaMemcpyDeviceToDevice);
+    }
+    std::vector<heongpu::DeviceVector<Data64>> encoded_matrices;
+    encoded_matrices.push_back(std::move(concatenated));
+
+    heongpu::Ciphertext<Scheme> C_result =
+        operators.multiply_matrix(C1, encoded_matrices, diags, galois_key);
+    std::cout << "Noise budget after multiply_matrix: "
+              << decryptor.remainder_noise_budget(C_result) << " bits"
               << std::endl;
 
-    /********************************************************************************
-     * MATRIX MULTIPLICATION EXAMPLE
-     ********************************************************************************/
-    std::cout << "\n--- Starting Homomorphic Matrix Multiplication ---" << std::endl;
-
-    std::vector<std::vector<int>> diags = {{0, 2, -2}};
-
-    std::cout << "Preparing encoded diagonals of the matrix..." << std::endl;
-    std::vector<uint64_t> diag0_vec(poly_modulus_degree, 3ULL);
-    std::vector<uint64_t> diag2_vec(poly_modulus_degree, 1ULL);
-    std::vector<uint64_t> diag_minus2_vec(poly_modulus_degree, 5ULL);
-
-    heongpu::Plaintext<Scheme> plain_diag0(context), plain_diag2(context), plain_diag_minus2(context);
-    encoder.encode(plain_diag0, diag0_vec);
-    encoder.encode(plain_diag2, diag2_vec);
-    encoder.encode(plain_diag_minus2, diag_minus2_vec);
-    
-    // 3. 인코딩된 대각선들을 하나의 DeviceVector에 순서대로 이어붙입니다.
-    size_t num_diagonals = diags[0].size();
-    
-    // Plaintext::size()는 요소(element)의 개수를 반환합니다.
-    size_t plain_size_elements = plain_diag0.size();
-    // 요소의 개수에 요소 하나의 크기(sizeof(uint64_t))를 곱하여 byte 단위 크기를 계산합니다.
-    size_t plain_size_bytes = plain_size_elements * sizeof(Data64);
-    
-    size_t total_elements = num_diagonals * plain_size_elements;
-    heongpu::DeviceVector<Data64> concatenated_diagonals(total_elements);
-
-    // 계산된 byte 크기를 사용하여 각 대각선 데이터를 GPU의 연속된 메모리 공간으로 복사합니다.
-    cudaMemcpy(concatenated_diagonals.data(), plain_diag0.data(), plain_size_bytes, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(concatenated_diagonals.data() + plain_size_elements, plain_diag2.data(), plain_size_bytes, cudaMemcpyDeviceToDevice);
-    cudaMemcpy(concatenated_diagonals.data() + (2 * plain_size_elements), plain_diag_minus2.data(), plain_size_bytes, cudaMemcpyDeviceToDevice);
-
-    std::vector<heongpu::DeviceVector<Data64>> encoded_matrices;
-    encoded_matrices.push_back(std::move(concatenated_diagonals));
-
-    std::cout << "Calling multiply_matrix function..." << std::endl;
-    heongpu::Ciphertext<Scheme> C_result = operators.multiply_matrix(
-        C1, encoded_matrices, diags, galois_key);
-
-    std::cout << "Decrypting and decoding the result..." << std::endl;
     heongpu::Plaintext<Scheme> P_result(context);
     decryptor.decrypt(P_result, C_result);
+    std::vector<uint64_t> result;
+    encoder.decode(result, P_result);
 
-    std::vector<uint64_t> vec_result;
-    encoder.decode(vec_result, P_result);
+    // Plaintext reference.
+    std::vector<uint64_t> expected(N, 0);
+    for (size_t i = 0; i < N; ++i)
+    {
+        const int row = static_cast<int>(i) / H * H;
+        const int col = static_cast<int>(i) % H;
+        unsigned __int128 acc = 0;
+        for (size_t k = 0; k < D; ++k)
+        {
+            const int src = row + (((col + diags[0][k]) % H) + H) % H;
+            acc += static_cast<unsigned __int128>(diag_values[k][i]) *
+                   message[src];
+        }
+        expected[i] = static_cast<uint64_t>(acc % t);
+    }
 
-    std::cout << "\nResult matrix after multiplication:" << std::endl;
-    display_matrix(vec_result, 0);
+    size_t bad = 0;
+    for (size_t i = 0; i < N; ++i)
+        bad += (result[i] != expected[i]);
 
-    std::cout << "\n--- Matrix Multiplication Example Finished ---" << std::endl;
+    std::cout << "\nExpected (plaintext product):";
+    display_matrix(expected, H);
+    std::cout << "Decrypted multiply_matrix result:";
+    display_matrix(result, H);
 
-    return EXIT_SUCCESS;
+    const bool ok = (bad == 0);
+    std::cout << (ok ? "[PASS] " : "[FAIL] ")
+              << "multiply_matrix == plaintext product (" << N - bad << "/"
+              << N << " slots match)" << std::endl;
+    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

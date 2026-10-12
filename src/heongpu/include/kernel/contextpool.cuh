@@ -19,10 +19,15 @@ namespace heongpu
         template <Scheme S> friend class HEContext;
 
       public:
+        // digit_size: number of Q primes per key-switching digit for the
+        // BFV-family branch (METHOD_II / III). 0 keeps the historical default
+        // of 2; RTF passes |P| so that dnum = ceil(|Q| / |P|) as in Lattigo's
+        // hybrid key switching (the CKKS branch always uses |P|).
         KeySwitchParameterGenerator(int poly_degree,
                                     std::vector<Data64> modulus, int P_size,
                                     scheme_type scheme,
-                                    keyswitching_type method);
+                                    keyswitching_type method,
+                                    int digit_size = 0);
 
       private:
         int n_;

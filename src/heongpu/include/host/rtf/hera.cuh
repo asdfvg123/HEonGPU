@@ -8,6 +8,7 @@
 #include "switchkey.cuh"
 #include "keygeneration.cuh"
 #include "bootstrapping.cuh"
+#include "decryption.cuh"
 
 #include "rtf/context.cuh"
 #include "rtf/encoder.cuh"
@@ -16,6 +17,11 @@
 #include "rtf/ciphertext.cuh"
 #include "rtf/evaluationkey.cuh"
 #include "rtf/operator.cuh"
+#include "rtf/secretkey.cuh"
+#include "rtf/rubato.h"
+#include <future>
+#include "rtf/slot_lintrans.cuh"
+#include "rtf/s2c_fft.cuh"
 
 #include "ckks/context.cuh"
 #include "ckks/ciphertext.cuh"
@@ -112,11 +118,98 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
 
+        // MixRows o MixColumns on every 64-slot block. With truncate = true
+        // the rows of the last n - l words are zero (Tr_{n,l} of the final
+        // round, folded into the matrix as the paper recommends).
         __host__ void linear(
             Ciphertext<Scheme::RTF>& input,
             Ciphertext<Scheme::RTF>& output,
+            const ExecutionOptions& options = ExecutionOptions(),
+            bool truncate = false
+        );
+
+        // Round constants of Rubato from the XOF (AES-128-CTR). Block j of the
+        // packed state (slots [64j, 64j + 64)) uses the seed
+        // nonce || (counter_start + j). Must be called before gen_stream_key.
+        __host__ void set_nonce(
+            const std::array<uint8_t, 8>& nonce, uint64_t counter_start = 0,
             const ExecutionOptions& options = ExecutionOptions()
         );
+
+        // Round constants of one nonce, in slot layout: rc[r][64j + i].
+        using RoundConstants = std::vector<std::vector<uint64_t>>;
+
+        // CPU part of set_nonce (XOF sampling only, no GPU work, read-only
+        // on this object): safe to run in a background thread while the GPU
+        // evaluates the previous nonce.
+        __host__ RoundConstants compute_round_constants(
+            const std::array<uint8_t, 8>& nonce, uint64_t counter_start = 0,
+            int max_threads = 0) const;
+        __host__ RoundConstants compute_round_constants(
+            const std::vector<std::vector<uint8_t>>& seeds,
+            int max_threads = 0) const;
+
+        // Starts compute_round_constants on a background thread.
+        __host__ std::future<RoundConstants> prepare_nonce_async(
+            const std::array<uint8_t, 8>& nonce, uint64_t counter_start = 0,
+            int max_threads = 0) const;
+
+        // GPU part of set_nonce: encodes the round constants as FV plaintexts.
+        __host__ void set_round_constants(
+            const RoundConstants& rc,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        // Same with one 16-byte XOF seed per block.
+        __host__ void set_xof_seeds(
+            const std::vector<std::vector<uint8_t>>& seeds,
+            const ExecutionOptions& options = ExecutionOptions()
+        );
+
+        __host__ const rubato::Params& get_rubato_params() const noexcept {
+            return rubato_params_;
+        }
+
+        // Client-side message scaling Delta: c = round(Delta * m) + z mod q.
+        __host__ double get_message_scaling() const noexcept {
+            return messageScaling_;
+        }
+        __host__ void set_message_ratio(double ratio) {
+            message_ratio_ = ratio;
+            messageScaling_ = plain_modulus_.value / message_ratio_;
+        }
+        __host__ double get_message_ratio() const noexcept {
+            return message_ratio_;
+        }
+
+        // SlotToCoeff_FV by the FFT-like factorization (rtf/s2c_fft.cuh).
+        // After this call S2C_FV puts slot i into coefficient
+        // s2c_coeff_index(i) and vec2poly places word i there too, so the
+        // two always agree; HalfBoot then returns the words in slot order.
+        // The key set by set_galois_key_s2c must hold
+        // s2c_fft_rotation_shifts() and the column rotation.
+        __host__ void gen_FV_S2C_FFT(
+            int levels_per_group = 4,
+            const ExecutionOptions& options = ExecutionOptions());
+        __host__ std::vector<int> s2c_fft_rotation_shifts() const;
+        __host__ void set_galois_key_s2c(Galoiskey<Scheme::RTF>& galois_key_s2c)
+        {
+            galois_key_s2c_ = galois_key_s2c;
+            galois_key_s2c_.store_in_device();
+        }
+        // Coefficient that S2C_FV moves slot i to (identity for the dense S2C).
+        __host__ int s2c_coeff_index(int slot) const
+        {
+            return s2c_fft_ ? s2c_fft_->coeff_index(slot) : slot;
+        }
+
+        // Row rotations whose Galois keys gen_stream_key needs (linear layers
+        // by baby-step/giant-step, plus -1 for the Feistel layer).
+        __host__ std::vector<int> rubato_rotation_shifts() const;
+
+        // Number of 64-word Rubato blocks packed in one FV ciphertext.
+        __host__ int get_block_count() const noexcept {
+            return n / rubato_params_.n;
+        }
         
         __host__ Ciphertext<Scheme::RTF> S2C_FV(
             Ciphertext<Scheme::RTF>& input,
@@ -143,10 +236,30 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
 
+        // FV modulus switching to a context whose ciphertext moduli are the
+        // first |Q'| of this one's (same P, same plaintext modulus): drops the
+        // last |Q| - |Q'| primes with rounding and returns the ciphertext as
+        // one of `target`. The noise budget is kept (up to |Q'| bits).
+        __host__ Ciphertext<Scheme::RTF> mod_switch_to(
+            Ciphertext<Scheme::RTF>& input, HEContext<Scheme::RTF>& target,
+            const ExecutionOptions& options = ExecutionOptions());
+
         __host__ void moddown_FV_inplace(
             Ciphertext<Scheme::RTF>& input,
             const ExecutionOptions& options = ExecutionOptions()
         );
+
+        // Verification helper: raw decryption at q0 of a one-modulus
+        // ciphertext in coefficient form (the output of transcipher_bfv2ckks,
+        // or an FV ciphertext after moddown_FV_inplace). Returns
+        // c0 + c1 * s mod q0 for every coefficient, centred in (-q0/2, q0/2].
+        __host__ std::vector<int64_t> decrypt_raw_q0(
+            Ciphertext<Scheme::CKKS>& ct, Secretkey<Scheme::RTF>& sk,
+            const ExecutionOptions& options = ExecutionOptions());
+
+        __host__ std::vector<int64_t> decrypt_raw_q0(
+            Ciphertext<Scheme::RTF>& ct, Secretkey<Scheme::RTF>& sk,
+            const ExecutionOptions& options = ExecutionOptions());
 
         __host__ heongpu::Ciphertext<Scheme::RTF> get_icCt(){
             return icCt_;
@@ -355,6 +468,10 @@ namespace heongpu
             }
         }
     private:
+        __host__ std::vector<int64_t> decrypt_raw_q0_impl(
+            const Data64* ct_device, Secretkey<Scheme::RTF>& sk,
+            cudaStream_t stream);
+
         HEContext<Scheme::RTF>& contextbfv_;   
         HEContext<Scheme::CKKS>& contextckks_;
 
@@ -477,8 +594,16 @@ namespace heongpu
         Data64 plain_psi_;
         Data64 plain_inv_psi;
 
-        // hera
-        int round_ = 2;
+        // Rubato (Par-128L)
+        rubato::Params rubato_params_ = rubato::Par128L;
+        int round_ = rubato::Par128L.rounds;
+        bool rc_ready_ = false;
+        std::shared_ptr<FVSlotToCoeffFFT> s2c_fft_;
+        Galoiskey<Scheme::RTF> galois_key_s2c_;
+
+        // MixRows o MixColumns, full and truncated (Tr_{n,l}) for Fin
+        SlotLinearTransform linear_full_;
+        SlotLinearTransform linear_trunc_;
         size_t rc_vec_size_ = 0;
 
         std::vector<heongpu::DeviceVector<Data64>> linear_matrix_diagonals_;
@@ -511,7 +636,10 @@ namespace heongpu
 
         //FV
         Data64 Delta_FV_;
-        const double message_ratio_ = 1<<15;
+        // q0 / Delta' of the RtF framework: the client scales messages by
+        // Delta = t / message_ratio_. 16 as in Rubato / RtF Par-128a
+        // (needs the arcsine HalfBoot); RtF Par-128 without arcsine uses 512.
+        double message_ratio_ = 16.0;
         double messageScaling_;
 
 

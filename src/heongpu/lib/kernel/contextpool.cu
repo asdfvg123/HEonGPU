@@ -68,11 +68,15 @@ namespace heongpu
 
     KeySwitchParameterGenerator::KeySwitchParameterGenerator(
         int poly_degree, std::vector<Data64> modulus, int P_size,
-        scheme_type scheme, keyswitching_type method)
+        scheme_type scheme, keyswitching_type method, int digit_size)
     {
         switch (static_cast<int>(scheme))
         {
             case 1: // BFV
+                if (digit_size > 0)
+                {
+                    m = digit_size;
+                }
                 if (static_cast<int>(method) == 2)
                 {
                     n_ = poly_degree;
@@ -125,6 +129,8 @@ namespace heongpu
                 if (static_cast<int>(method) == 2)
                 {
                     n_ = poly_degree;
+
+                    m = P_size;
 
                     first_Qtilda_ = modulus.size();
                     first_Q_ = first_Qtilda_ - P_size;
@@ -250,7 +256,7 @@ namespace heongpu
                     {
                         if (i != j)
                         {
-                            temp = OPERATOR64::mult(
+                            temp = mult_mod_exact(
                                 temp, ibase[j + index].value, obase[k]);
                         }
                     }
@@ -289,7 +295,7 @@ namespace heongpu
                             {
                                 Data64 base_inner =
                                     ibase[j + index].value % obase[k].value;
-                                temp = OPERATOR64::mult(temp, base_inner,
+                                temp = mult_mod_exact(temp, base_inner,
                                                         obase[k]);
                             }
                         }
@@ -324,7 +330,7 @@ namespace heongpu
                 {
                     if (i != j)
                     {
-                        temp = OPERATOR64::mult(temp, ibase[j + index].value,
+                        temp = mult_mod_exact(temp, ibase[j + index].value,
                                                 ibase[i + index]);
                     }
                 }
@@ -361,7 +367,7 @@ namespace heongpu
                         {
                             Data64 ibase_inner =
                                 ibase[j + index].value % ibase[i + index].value;
-                            temp = OPERATOR64::mult(temp, ibase_inner,
+                            temp = mult_mod_exact(temp, ibase_inner,
                                                     ibase[i + index]);
                         }
                     }
@@ -457,7 +463,7 @@ namespace heongpu
                 Data64 temp = 1;
                 for (int j = 0; j < I_j_[l]; j++)
                 {
-                    temp = OPERATOR64::mult(
+                    temp = mult_mod_exact(
                         temp, ibase[j + I_location_[l]].value, obase[i]);
                 }
                 prod.push_back(temp);
@@ -495,7 +501,7 @@ namespace heongpu
                         Data64 ibase_inner =
                             ibase[j + I_location_[main_lp][l]].value %
                             obase[i].value;
-                        temp = OPERATOR64::mult(temp, ibase_inner, obase[i]);
+                        temp = mult_mod_exact(temp, ibase_inner, obase[i]);
                     }
                     prod.push_back(temp);
                 }
@@ -541,7 +547,7 @@ namespace heongpu
 
             for (int j = 1; j < n_; j++)
             {
-                Data64 exp = OPERATOR64::mult(table[(j - 1)], B_prime_psi[i],
+                Data64 exp = mult_mod_exact(table[(j - 1)], B_prime_psi[i],
                                               B_prime[i]);
                 table.push_back(exp);
             }
@@ -568,7 +574,7 @@ namespace heongpu
             for (int j = 1; j < n_; j++)
             {
                 Data64 exp =
-                    OPERATOR64::mult(table[(j - 1)], inv_root, B_prime[i]);
+                    mult_mod_exact(table[(j - 1)], inv_root, B_prime[i]);
                 table.push_back(exp);
             }
 
@@ -611,7 +617,7 @@ namespace heongpu
                     {
                         if (i != j)
                         {
-                            temp = OPERATOR64::mult(
+                            temp = mult_mod_exact(
                                 temp, ibase[j + index].value, obase[k]);
                         }
                     }
@@ -640,7 +646,7 @@ namespace heongpu
                     if (i != j)
                     {
                         Data64 B_ = ibase[j].value % obase[k].value;
-                        temp = OPERATOR64::mult(temp, B_, obase[k]);
+                        temp = mult_mod_exact(temp, B_, obase[k]);
                     }
                 }
                 base_matrix.push_back(temp);
@@ -665,7 +671,7 @@ namespace heongpu
                 {
                     if (i != j)
                     {
-                        temp = OPERATOR64::mult(temp, ibase[j + index].value,
+                        temp = mult_mod_exact(temp, ibase[j + index].value,
                                                 ibase[i + index]);
                     }
                 }
@@ -692,7 +698,7 @@ namespace heongpu
                 {
                     if (i != j)
                     {
-                        temp = OPERATOR64::mult(temp, ibase[j].value, ibase[i]);
+                        temp = mult_mod_exact(temp, ibase[j].value, ibase[i]);
                     }
                 }
                 inv_Mi.push_back(OPERATOR64::modinv(temp, ibase[i]));
@@ -720,7 +726,7 @@ namespace heongpu
                 Data64 temp = 1;
                 for (int j = 0; j < I_j_[l]; j++)
                 {
-                    temp = OPERATOR64::mult(
+                    temp = mult_mod_exact(
                         temp, ibase[j + I_location_[l]].value, obase[i]);
                 }
                 prod.push_back(temp);
@@ -751,7 +757,7 @@ namespace heongpu
                     Data64 base =
                         ibase[j].value % obase[i + I_location_[l]].value;
                     temp =
-                        OPERATOR64::mult(temp, base, obase[i + I_location_[l]]);
+                        mult_mod_exact(temp, base, obase[i + I_location_[l]]);
                 }
                 prod.push_back(temp);
             }
@@ -787,7 +793,7 @@ namespace heongpu
                             {
                                 Data64 base_inner =
                                     ibase[j + index].value % obase[k].value;
-                                temp = OPERATOR64::mult(temp, base_inner,
+                                temp = mult_mod_exact(temp, base_inner,
                                                         obase[k]);
                             }
                         }
@@ -828,7 +834,7 @@ namespace heongpu
                         if (i != j)
                         {
                             Data64 B_ = ibase[j].value % obase[k].value;
-                            temp = OPERATOR64::mult(temp, B_, obase[k]);
+                            temp = mult_mod_exact(temp, B_, obase[k]);
                         }
                     }
                     base_matrix.push_back(temp);
@@ -868,7 +874,7 @@ namespace heongpu
                         {
                             Data64 ibase_inner =
                                 ibase[j + index].value % ibase[i + index].value;
-                            temp = OPERATOR64::mult(temp, ibase_inner,
+                            temp = mult_mod_exact(temp, ibase_inner,
                                                     ibase[i + index]);
                         }
                     }
@@ -900,7 +906,7 @@ namespace heongpu
             {
                 if (i != j)
                 {
-                    temp = OPERATOR64::mult(temp, ibase[j].value, ibase[i]);
+                    temp = mult_mod_exact(temp, ibase[j].value, ibase[i]);
                 }
             }
             inv_Mi.push_back(OPERATOR64::modinv(temp, ibase[i]));
@@ -934,7 +940,7 @@ namespace heongpu
                     Data64 temp = 1;
                     for (int j = 0; j < I_j_[main_lp][l]; j++)
                     {
-                        temp = OPERATOR64::mult(
+                        temp = mult_mod_exact(
                             temp, ibase[j + I_location_[main_lp][l]].value,
                             obase[i]);
                     }
@@ -978,7 +984,7 @@ namespace heongpu
                     { // r_prime
                         Data64 base = ibase[j].value %
                                       obase[i + I_location_[main_lp][l]].value;
-                        temp = OPERATOR64::mult(
+                        temp = mult_mod_exact(
                             temp, base, obase[i + I_location_[main_lp][l]]);
                     }
                     prod.push_back(temp);

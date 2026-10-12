@@ -1,6 +1,12 @@
 
 #include "rtf/hera.cuh"
 
+#include <atomic>
+#include <future>
+#include <sched.h>
+#include <set>
+#include <thread>
+
 
 namespace heongpu
 {
@@ -186,12 +192,24 @@ namespace heongpu
         plain_psi_ = context.plain_psi_;
         messageScaling_ = plain_modulus_.value / message_ratio_;
         
+        const int block = rubato_params_.n;
+        if (n % block != 0 || (n >> 1) % block != 0)
+        {
+            throw std::invalid_argument(
+                "HEHERA: N/2 must be a multiple of the Rubato block size.");
+        }
+        if (plain_modulus_.value != rubato_params_.q)
+        {
+            throw std::invalid_argument(
+                "HEHERA: plain modulus must be the Rubato modulus q.");
+        }
+        round_ = rubato_params_.rounds;
         rc_vec_size_ = static_cast<size_t>(round_ + 1) * n;
-        // initialize IC
+        // ic = (1, 2, ..., n) in every block
         icVec.resize(n);
         for (int i = 0; i < n; i++)
         {
-            icVec[i] = (i % 16) + 1;
+            icVec[i] = (i % block) + 1;
         }
         icPt_ = Plaintext<Scheme::RTF>(context);
         icCt_ = Ciphertext<Scheme::RTF>(context);
@@ -201,54 +219,10 @@ namespace heongpu
         
         icCt_.store_in_device(stream);
 
-        // initialize round constants
-        // TODO : this part takes time and thus synchronization issue
-
-        // heongpu::DeviceVector<Data64> d_rc(rc_vec_size_, stream);
-        // heongpu::DeviceVector<Modulus64> d_mod(1, stream);
-
-        // HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-        //     d_mod.data(), &plain_modulus_, sizeof(Modulus64), cudaMemcpyHostToDevice, stream));
-
-        // heongpu::RandomNumberGenerator::instance()
-        //     .modular_uniform_random_number_generation(
-        //         d_rc.data(), d_mod.data(), static_cast<Data64>(n_power),
-        //         /*mod_count=*/1, /*repeat_count=*/round_, stream);
-
-        // HEONGPU_CUDA_CHECK(cudaGetLastError());
-        // HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
-        
-        std::vector<uint64_t> flat(rc_vec_size_, 2ULL);
-        // HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-        //     flat.data(), d_rc.data(), rc_vec_size_ * sizeof(Data64),
-        //     cudaMemcpyDeviceToHost, stream));
-        // HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
-        
-        rcVec.assign(static_cast<size_t>(round_ + 1), std::vector<uint64_t>(n));
-        for (int r = 0; r < round_+1; ++r) {
-            rcVec[r].assign(flat.begin() + r * n, flat.begin() + (r + 1) * n);
-        }
-
-        
-        rcPt.reserve(round_+1);
-        rckCt.reserve(round_+1);
-        // encode rc
-        
-        for (int r = 0; r < round_+1; ++r) {
-            Plaintext<Scheme::RTF> pt(context);
-            encoder_.encode(pt, rcVec[r], options);
-            pt.store_in_device(options.stream_);
-            rcPt.emplace_back(std::move(pt));
-        }
-
+        // Round constants are set per nonce by set_nonce / set_xof_seeds.
 
         const size_t row_len = n >> 1; // BFV batching row length
-        const size_t B = 64;           // 16x16 block, NEEDS TO BE CHANGED
-        if (row_len % B != 0)
-        {
-            throw std::invalid_argument(
-                "HEHERA::ctor: (n/2) must be a multiple of 16.");
-        }
+        const size_t B = block;
         const size_t blocks_per_row = row_len / B;
 
         
@@ -264,60 +238,58 @@ namespace heongpu
         encoder_.encode(feistel_maskPt_, feistel_mask, options);
 
 
-        linear_matrix_shifts_.resize(1);
-        linear_matrix_shifts_[0].reserve(64+64-1);
-        linear_matrix_shifts_[0].push_back(0);
-        
-        // Lower diagonals (< 0), Upper diagonals (> 0)
-        for (int s = 1; s < (int)B; ++s) linear_matrix_shifts_[0].push_back(-s);
-        for (int s = 1; s < (int)B; ++s) linear_matrix_shifts_[0].push_back(s);
-
-        const size_t D = linear_matrix_shifts_[0].size();
-        std::cout << "Diagonals count: " << D << std::endl;
-        heongpu::DeviceVector<Data64> blob(n * D, stream);
-        heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(context);
-
-        for (size_t k = 0; k < D; ++k)
+        // MixRows o MixColumns = M64 = M8 (x) M8 on every 64-slot block, as a
+        // slot-domain transform with diagonals at rotations -63..63.
+        // rows_kept = l zeroes the truncated output words (Tr_{n,l}).
+        auto build_diagonals = [&](int rows_kept)
         {
-            const int rot = linear_matrix_shifts_[0][k];
-            std::vector<uint64_t> hdiag_vec(n, 0ULL);
-
-            for (size_t row = 0; row < 2; ++row)
+            SlotLinearTransform::DiagMap diags;
+            for (int rot = -(int) B + 1; rot < (int) B; ++rot)
             {
-                const size_t row_base = row * row_len;
-                for (size_t blk = 0; blk < blocks_per_row; ++blk)
-                {
-                    const size_t base = row_base + blk * B;
-                    if (rot == 0) { // Main diagonal
-                        for (int r = 0; r < (int)B; ++r) hdiag_vec[base + r] = M64[r][r];
-                    } else if (rot > 0) { // Upper diagonals
-                        const int s = rot;
-                        for (int r = 0; r < (int)B - s; ++r) hdiag_vec[base + r] = M64[r][r + s];
-                    } else { // Lower diagonals
-                        const int s = -rot;
-                        for (int r = s; r < (int)B; ++r) hdiag_vec[base + r] = M64[r][r - s];
+                std::vector<uint64_t> d(n, 0ULL);
+                bool nonzero = false;
+                for (size_t row = 0; row < 2; ++row)
+                    for (size_t blk = 0; blk < blocks_per_row; ++blk)
+                    {
+                        const size_t base = row * row_len + blk * B;
+                        for (int r = 0; r < rows_kept; ++r)
+                        {
+                            const int c = r + rot;
+                            if (c >= 0 && c < (int) B)
+                            {
+                                d[base + r] = M64[r][c];
+                                nonzero = true;
+                            }
+                        }
                     }
-                }
+                if (nonzero)
+                    diags[rot] = std::move(d);
             }
-            
-            encoder.encode(pt_diag, hdiag_vec, options);
-            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                blob.data() + k * n, pt_diag.data(), n * sizeof(Data64),
-                cudaMemcpyDeviceToDevice, stream));
-        }
-        
-        // Store the completed blob in the member variable
-        linear_matrix_diagonals_.emplace_back(std::move(blob));
+            return diags;
+        };
+        // Both start their baby steps at rotation -(B - 1), so they share
+        // the (hoisted) baby-step keys.
+        const int base_rot = -(int) B + 1;
+        linear_full_ = SlotLinearTransform(context, encoder, op,
+                                           build_diagonals((int) B), options,
+                                           base_rot);
+        linear_trunc_ = SlotLinearTransform(
+            context, encoder, op, build_diagonals(rubato_params_.l), options,
+            base_rot);
         HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::cout << "HERA initialized." << std::endl;
 
     }
     __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::precompute(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& key,
         const heongpu::ExecutionOptions& options)
     {
+        if (!rc_ready_)
+        {
+            throw std::logic_error(
+                "HEHERA: round constants not set; call set_nonce first.");
+        }
         rckCt.clear();
-        rckCt.reserve(round_+1);  // you only fill 0..round_-1
+        rckCt.reserve(round_+1);
         auto opt = ExecutionOptions().set_stream(options.stream_)
                                     .set_storage_type(storage_type::DEVICE)
                                     .set_initial_location(true);
@@ -352,9 +324,10 @@ namespace heongpu
 
         }
 
+        // Fin = Tr o ARK o MR o MC o Feistel o MR o MC
         linear(result, result, options);
         feistel(result, result, options);
-        linear(result, result, options);
+        linear(result, result, options, /*truncate=*/true);
         add_round_key(result, rckCt[round_], result, options);
 
         HEONGPU_CUDA_CHECK(cudaGetLastError());
@@ -419,7 +392,7 @@ namespace heongpu
     __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::linear(
         heongpu::Ciphertext<heongpu::Scheme::RTF>& input,
         heongpu::Ciphertext<heongpu::Scheme::RTF>& output,
-        const ExecutionOptions& options)
+        const ExecutionOptions& options, bool truncate)
     {
         cudaStream_t stream = options.stream_;
         if (stream == cudaStreamDefault) stream = input.stream();
@@ -441,15 +414,153 @@ namespace heongpu
             operator_.transform_from_ntt_inplace(x, opt);
         }
 
-        auto y = operator_.multiply_matrix(x, 
-                                          this->linear_matrix_diagonals_, 
-                                          this->linear_matrix_shifts_, 
-                                          galois_key_hera_, 
-                                          opt);
+        const SlotLinearTransform& lt = truncate ? linear_trunc_ : linear_full_;
+        auto y = lt.apply(operator_, contextbfv_, x, galois_key_hera_, opt);
         output = y;
         HEONGPU_CUDA_CHECK(cudaGetLastError());
         HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::gen_FV_S2C_FFT(
+        int levels_per_group, const ExecutionOptions& options)
+    {
+        s2c_fft_ = std::make_shared<FVSlotToCoeffFFT>(
+            contextbfv_, encoder_, operator_, levels_per_group, options);
+    }
+
+    __host__ std::vector<int>
+    heongpu::HEHERA<heongpu::Scheme::RTF>::s2c_fft_rotation_shifts() const
+    {
+        if (!s2c_fft_)
+            throw std::logic_error("HEHERA: call gen_FV_S2C_FFT first.");
+        return s2c_fft_->rotation_shifts();
+    }
+
+    __host__ std::vector<int>
+    heongpu::HEHERA<heongpu::Scheme::RTF>::rubato_rotation_shifts() const
+    {
+        std::set<int> s = {-1};
+        for (int v : linear_full_.rotation_shifts())
+            s.insert(v);
+        for (int v : linear_trunc_.rotation_shifts())
+            s.insert(v);
+        return std::vector<int>(s.begin(), s.end());
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::set_nonce(
+        const std::array<uint8_t, 8>& nonce, uint64_t counter_start,
+        const ExecutionOptions& options)
+    {
+        set_round_constants(compute_round_constants(nonce, counter_start),
+                            options);
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::set_xof_seeds(
+        const std::vector<std::vector<uint8_t>>& seeds,
+        const ExecutionOptions& options)
+    {
+        set_round_constants(compute_round_constants(seeds), options);
+    }
+
+    __host__ heongpu::HEHERA<heongpu::Scheme::RTF>::RoundConstants
+    heongpu::HEHERA<heongpu::Scheme::RTF>::compute_round_constants(
+        const std::array<uint8_t, 8>& nonce, uint64_t counter_start,
+        int max_threads) const
+    {
+        std::vector<std::vector<uint8_t>> seeds(get_block_count());
+        for (int j = 0; j < get_block_count(); ++j)
+            seeds[j] = rubato::xof_seed(nonce, counter_start + j);
+        return compute_round_constants(seeds, max_threads);
+    }
+
+    __host__ heongpu::HEHERA<heongpu::Scheme::RTF>::RoundConstants
+    heongpu::HEHERA<heongpu::Scheme::RTF>::compute_round_constants(
+        const std::vector<std::vector<uint8_t>>& seeds, int max_threads) const
+    {
+        const int block = rubato_params_.n;
+        const int blocks = get_block_count();
+        if ((int) seeds.size() != blocks)
+        {
+            throw std::invalid_argument(
+                "HEHERA::compute_round_constants: need one seed per block.");
+        }
+
+        RoundConstants rc_all(round_ + 1, std::vector<uint64_t>(n, 0ULL));
+        // One XOF per block; blocks are independent, so split them over the
+        // CPUs this process may run on.
+        auto fill = [&](int j0, int j1)
+        {
+            for (int j = j0; j < j1; ++j)
+            {
+                auto rc = rubato::round_constants(seeds[j], rubato_params_);
+                for (int r = 0; r <= round_; ++r)
+                    for (int i = 0; i < block; ++i)
+                        rc_all[r][j * block + i] = rc[r][i];
+                // Tr_{n,l} o ARK: the truncated words get no round key.
+                for (int i = rubato_params_.l; i < block; ++i)
+                    rc_all[round_][j * block + i] = 0;
+            }
+        };
+        int n_threads = 1;
+        {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                n_threads = CPU_COUNT(&set);
+        }
+        if (max_threads > 0)
+            n_threads = std::min(n_threads, max_threads);
+        n_threads = std::max(1, std::min(n_threads, blocks / 16));
+        if (n_threads == 1)
+        {
+            fill(0, blocks);
+        }
+        else
+        {
+            std::vector<std::thread> pool;
+            const int per = (blocks + n_threads - 1) / n_threads;
+            for (int t = 0; t < n_threads; ++t)
+            {
+                const int j0 = t * per, j1 = std::min(blocks, j0 + per);
+                if (j0 < j1)
+                    pool.emplace_back(fill, j0, j1);
+            }
+            for (auto& th : pool)
+                th.join();
+        }
+        return rc_all;
+    }
+
+    __host__ std::future<heongpu::HEHERA<heongpu::Scheme::RTF>::RoundConstants>
+    heongpu::HEHERA<heongpu::Scheme::RTF>::prepare_nonce_async(
+        const std::array<uint8_t, 8>& nonce, uint64_t counter_start,
+        int max_threads) const
+    {
+        return std::async(std::launch::async,
+                          [this, nonce, counter_start, max_threads]()
+                          {
+                              return compute_round_constants(
+                                  nonce, counter_start, max_threads);
+                          });
+    }
+
+    __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::set_round_constants(
+        const RoundConstants& rc, const ExecutionOptions& options)
+    {
+        if ((int) rc.size() != round_ + 1)
+            throw std::invalid_argument("HEHERA::set_round_constants: rounds");
+        rcVec = rc;
+        rcPt.clear();
+        rcPt.reserve(round_ + 1);
+        for (int r = 0; r < round_ + 1; ++r)
+        {
+            Plaintext<Scheme::RTF> pt(contextbfv_);
+            encoder_.encode(pt, rcVec[r], options);
+            pt.store_in_device(options.stream_);
+            rcPt.emplace_back(std::move(pt));
+        }
+        rc_ready_ = true;
     }
 
     static inline void rotate_subrange_right_inplace(std::vector<uint64_t>& v,
@@ -530,7 +641,6 @@ namespace heongpu
         heongpu::DeviceVector<Data64> blob1(per_diag_len_plain * (size_t)(N - H), stream);
 
         heongpu::Plaintext<heongpu::Scheme::RTF> pt_diag(contextbfv_);
-        std::vector<uint64_t> diag_slots(N);
 
         const uint64_t generator = generator_;
         std::vector<uint64_t> gen_pow(N);
@@ -546,7 +656,11 @@ namespace heongpu
             gen_pow[i] = twoN - pos;
             pos = (pos * generator) % twoN;
         }
-        for (int s = 0; s < N; ++s)
+
+        // Diagonal s of the slot -> coefficient matrix, pre-rotated by its
+        // giant step. O(N^2) host work: the diagonals are computed by a pool
+        // of threads (one batch at a time), then encoded on the GPU.
+        auto build_diag = [&](int s, std::vector<uint64_t>& diag_slots)
         {
             for (int i = 0; i < N; ++i) {
                 const int j_col = row_aligned_col_idx(i, s, H); 
@@ -562,21 +676,47 @@ namespace heongpu
             int giant = i_big * g2;
 
             pre_rotate_diagonals(diag_slots, H, giant);
+        };
 
-            encoder_.encode(pt_diag, diag_slots, options);
+        int n_threads = 1;
+        {
+            cpu_set_t set;
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                n_threads = CPU_COUNT(&set);
+            n_threads = std::max(1, std::min(n_threads, 64));
+        }
+        const int batch = std::min(N, 4 * n_threads);
+        std::vector<std::vector<uint64_t>> diag_batch(
+            batch, std::vector<uint64_t>(N));
 
-            // 2) NTT(RNS) 로 변환 → 내부 버퍼가 N * Q_size_ 로 바뀜
-            // operator_.transform_to_ntt_inplace(pt_diag, options);
+        for (int s0 = 0; s0 < N; s0 += batch)
+        {
+            const int nb = std::min(batch, N - s0);
+            {
+                std::vector<std::thread> pool;
+                std::atomic<int> next(0);
+                const int nt = std::min(n_threads, nb);
+                for (int t = 0; t < nt; ++t)
+                {
+                    pool.emplace_back([&]()
+                    {
+                        for (int b = next++; b < nb; b = next++)
+                            build_diag(s0 + b, diag_batch[b]);
+                    });
+                }
+                for (auto& th : pool)
+                    th.join();
+            }
 
-            // 3) ⬇⬇⬇ 변경: N이 아니라 N * Q_size_ 바이트를 복사
-            const Data64* src_plain = pt_diag.data();                // length = N (plain)
-            if (s < H) {
-                Data64* dst = blob0.data() + ((size_t)s) * per_diag_len_plain;
-                HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
-                    dst, src_plain, per_diag_len_plain * sizeof(Data64),
-                    cudaMemcpyDeviceToDevice, stream));
-            } else {
-                Data64* dst = blob1.data() + ((size_t)(s - H)) * per_diag_len_plain;
+            for (int b = 0; b < nb; ++b)
+            {
+                const int s = s0 + b;
+                encoder_.encode(pt_diag, diag_batch[b], options);
+
+                const Data64* src_plain = pt_diag.data();                // length = N (plain)
+                Data64* dst = (s < H)
+                    ? blob0.data() + ((size_t)s) * per_diag_len_plain
+                    : blob1.data() + ((size_t)(s - H)) * per_diag_len_plain;
                 HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
                     dst, src_plain, per_diag_len_plain * sizeof(Data64),
                     cudaMemcpyDeviceToDevice, stream));
@@ -598,6 +738,10 @@ namespace heongpu
         heongpu::Ciphertext<heongpu::Scheme::RTF>& ct_in,
         const ExecutionOptions& options)
     {
+        if (s2c_fft_)
+        {
+            return s2c_fft_->apply(ct_in, galois_key_s2c_, options);
+        }
         if (!is_S2C_initialized_) {
             throw std::invalid_argument("S2C matrix not initialized; call gen_FV_S2C_Matrix() first.");
         }
@@ -630,7 +774,9 @@ namespace heongpu
 
         std::vector<uint64_t> coeffs((size_t)N, 0ULL);
         const size_t use_len = std::min(input.size(), (size_t)N);
-        for (size_t i = 0; i < use_len; ++i) coeffs[i] = t ? (input[i] % t) : input[i];
+        // word i goes where S2C_FV puts keystream slot i
+        for (size_t i = 0; i < use_len; ++i)
+            coeffs[s2c_coeff_index((int) i)] = t ? (input[i] % t) : input[i];
 
         heongpu::DeviceVector<Data64> dev_coeffs;
         dev_coeffs.resize(N, stream);
@@ -672,11 +818,23 @@ namespace heongpu
         if (ct_bfv.coeff_modulus_count() > contextckks_.get_ciphertext_modulus_count()) {
             throw std::invalid_argument("BFV ciphertext has more moduli than the CKKS context supports.");
         }
+        {
+            // The residues are copied as they are: the FV and CKKS chains
+            // must share their first primes (RtF uses one chain for both).
+            const auto ckks_primes = contextckks_.get_key_modulus();
+            for (int i = 0; i < ct_bfv.coeff_modulus_count(); ++i)
+            {
+                if (ckks_primes[i].value != prime_vector_[i].value)
+                {
+                    throw std::invalid_argument(
+                        "transcipher_bfv2ckks: FV and CKKS moduli differ.");
+                }
+            }
+        }
 
         Ciphertext<Scheme::CKKS> ct_ckks(contextckks_, options);
         ct_ckks.coeff_modulus_count_ = ct_bfv.coeff_modulus_count();
         ct_ckks.depth_ = contextckks_.get_ciphertext_modulus_count() - ct_bfv.coeff_modulus_count();
-        std::cout << "transciphering ckks depth :" << ct_ckks.depth_ << std::endl;
 
         if (!ct_bfv.is_on_device()) {
             ct_bfv.store_in_device(stream);
@@ -739,13 +897,9 @@ namespace heongpu
         const double q0 = static_cast<double>(ckks_moduli[0].value);
         const double t  = static_cast<double>(contextbfv_.get_plain_modulus().value);
 
-        double initial_scale      = (q0 / t) * messageScaling_;
-        double log2_scale         = std::log2(initial_scale);
-        double rounded_log2_scale = std::round(log2_scale); // q0 / message_ratio_
-        ct_ckks.scale_ = std::exp2(rounded_log2_scale);
-        // ct_ckks.scale_ = 0;
-        
-        std::cout << "Initial scale set to: " << ct_ckks.scale_ << std::endl;
+        // After the mod-down the FV ciphertext encrypts round(q0/t * c) with
+        // c = round(Delta * m), i.e. m at scale q0 * Delta / t (= q0 / ratio).
+        ct_ckks.scale_ = (q0 / t) * messageScaling_;
         ct_ckks.rescale_required_    = false;
         ct_ckks.ciphertext_generated_ = true;
         ct_ckks.scheme_ = heongpu::scheme_type::ckks;
@@ -753,6 +907,66 @@ namespace heongpu
         ct_ckks.cipher_size_ = ct_bfv.size();
         
         return ct_ckks;
+    }
+
+    __host__ Ciphertext<Scheme::RTF> HEHERA<heongpu::Scheme::RTF>::mod_switch_to(
+        Ciphertext<Scheme::RTF>& input, HEContext<Scheme::RTF>& target,
+        const ExecutionOptions& options)
+    {
+        cudaStream_t stream = options.stream_;
+        if (stream == cudaStreamDefault) stream = input.stream();
+
+        const int target_count = target.Q_size;
+        if (target.n != n || target.plain_modulus_.value != plain_modulus_.value)
+            throw std::invalid_argument("mod_switch_to: ring or t differs");
+        if (target_count < 1 || target_count > input.coeff_modulus_count())
+            throw std::invalid_argument("mod_switch_to: bad target level");
+        for (int i = 0; i < target_count; i++)
+            if (target.prime_vector_[i].value != prime_vector_[i].value)
+                throw std::invalid_argument(
+                    "mod_switch_to: target moduli are not a prefix");
+        if (input.in_ntt_domain())
+            operator_.transform_from_ntt_inplace(input, options);
+        input.store_in_device(stream);
+
+        const int poly_count = input.size();
+        DeviceVector<Data64> buf_a(input.memory_size(), stream);
+        DeviceVector<Data64> buf_b(input.memory_size(), stream);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+            buf_a.data(), input.data(), input.memory_size() * sizeof(Data64),
+            cudaMemcpyDeviceToDevice, stream));
+        Data64* d_in = buf_a.data();
+        Data64* d_out = buf_b.data();
+        for (int L_plus_1 = input.coeff_modulus_count();
+             L_plus_1 > target_count; --L_plus_1)
+        {
+            const int current_L_idx = L_plus_1 - 1;
+            const size_t invq_base_idx =
+                static_cast<size_t>(current_L_idx) * (current_L_idx - 1) / 2;
+            dim3 grid((n + 255) / 256, current_L_idx, poly_count);
+            moddown_FV_kernel<<<grid, dim3(256, 1, 1), 0, stream>>>(
+                d_in, d_out, modulus_->data(), qhalf_->data(), invq_->data(),
+                n_power, current_L_idx, invq_base_idx);
+            HEONGPU_CUDA_CHECK(cudaGetLastError());
+            std::swap(d_in, d_out);
+        }
+
+        const size_t words = (size_t) poly_count * target_count * n;
+        Ciphertext<Scheme::RTF> out(target);
+        out.device_locations_ = DeviceVector<Data64>(words, stream);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(out.device_locations_.data(), d_in,
+                                           words * sizeof(Data64),
+                                           cudaMemcpyDeviceToDevice, stream));
+        out.scheme_ = input.scheme_;
+        out.ring_size_ = input.ring_size_;
+        out.coeff_modulus_count_ = target_count;
+        out.cipher_size_ = poly_count;
+        out.in_ntt_domain_ = false;
+        out.relinearization_required_ = input.relinearization_required_;
+        out.ciphertext_generated_ = true;
+        out.storage_type_ = storage_type::DEVICE;
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        return out;
     }
 
     __host__ void HEHERA<heongpu::Scheme::RTF>::moddown_FV_inplace(
@@ -829,6 +1043,91 @@ namespace heongpu
         // debug_print_ct_coeffs_bfv(input, *modulus_, stream);
 
         return;
+    }
+
+    __host__ std::vector<int64_t> HEHERA<heongpu::Scheme::RTF>::decrypt_raw_q0(
+        Ciphertext<Scheme::CKKS>& ct, Secretkey<Scheme::RTF>& sk,
+        const ExecutionOptions& options)
+    {
+        if (ct.coeff_modulus_count() != 1 || ct.in_ntt_domain() ||
+            ct.size() != 2)
+        {
+            throw std::invalid_argument(
+                "decrypt_raw_q0: need a 2-component ciphertext at q0 in "
+                "coefficient form.");
+        }
+        return decrypt_raw_q0_impl(ct.data(), sk, options.stream_);
+    }
+
+    __host__ std::vector<int64_t> HEHERA<heongpu::Scheme::RTF>::decrypt_raw_q0(
+        Ciphertext<Scheme::RTF>& ct, Secretkey<Scheme::RTF>& sk,
+        const ExecutionOptions& options)
+    {
+        if (ct.coeff_modulus_count() != 1 || ct.in_ntt_domain() ||
+            ct.size() != 2)
+        {
+            throw std::invalid_argument(
+                "decrypt_raw_q0: need a 2-component ciphertext at q0 in "
+                "coefficient form.");
+        }
+        return decrypt_raw_q0_impl(ct.data(), sk, options.stream_);
+    }
+
+    __host__ std::vector<int64_t>
+    HEHERA<heongpu::Scheme::RTF>::decrypt_raw_q0_impl(
+        const Data64* ct_device, Secretkey<Scheme::RTF>& sk,
+        cudaStream_t stream)
+    {
+        // The secret key is kept in NTT form over Q x P; residue 0 is s mod q0.
+        if (!sk.is_on_device())
+        {
+            sk.store_in_device(stream);
+        }
+
+        // c1 * s at q0 (the first residue of the secret key), NTT domain.
+        DeviceVector<Data64> c1s(n, stream);
+        gpuntt::ntt_rns_configuration<Data64> cfg_ntt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::FORWARD,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .stream = stream};
+        gpuntt::GPU_NTT(const_cast<Data64*>(ct_device) + n, c1s.data(),
+                        ntt_table_->data(), modulus_->data(), cfg_ntt, 1, 1);
+        sk_multiplication<<<dim3((n >> 8), 1, 1), 256, 0, stream>>>(
+            c1s.data(), sk.data(), c1s.data(), modulus_->data(), n_power, 1);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = n_power,
+            .ntt_type = gpuntt::INVERSE,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = n_inverse_->data(),
+            .stream = stream};
+        gpuntt::GPU_NTT_Inplace(c1s.data(), intt_table_->data(),
+                                modulus_->data(), cfg_intt, 1, 1);
+        HEONGPU_CUDA_CHECK(cudaGetLastError());
+
+        std::vector<Data64> h_c0(n), h_c1s(n);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(h_c0.data(), ct_device,
+                                           n * sizeof(Data64),
+                                           cudaMemcpyDeviceToHost, stream));
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(h_c1s.data(), c1s.data(),
+                                           n * sizeof(Data64),
+                                           cudaMemcpyDeviceToHost, stream));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        const Data64 q0 = prime_vector_[0].value;
+        std::vector<int64_t> out(n);
+        for (int i = 0; i < n; ++i)
+        {
+            unsigned __int128 v =
+                ((unsigned __int128) h_c0[i] + h_c1s[i]) % q0;
+            const Data64 r = static_cast<Data64>(v);
+            out[i] = (r > q0 / 2) ? -static_cast<int64_t>(q0 - r)
+                                  : static_cast<int64_t>(r);
+        }
+        return out;
     }
 
     __host__ void HEHERA<heongpu::Scheme::RTF>::gen_FV_moddown_params(

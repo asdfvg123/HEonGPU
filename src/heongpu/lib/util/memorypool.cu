@@ -5,6 +5,8 @@
 
 #include "memorypool.cuh"
 #include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
 
 std::shared_ptr<MemoryPool::HostResource> MemoryPool::host_base_ = nullptr;
 std::shared_ptr<MemoryPool::HostPoolResource> MemoryPool::host_pool_ = nullptr;
@@ -58,6 +60,22 @@ void MemoryPool::initialize()
             roundup_256(static_cast<size_t>(104857600));
         size_t max_host_pool_size = roundup_256(
             static_cast<size_t>(total_host_memory * max_host_memorypool_size));
+        // RMM grows a pool with a maximum size by half of the remaining
+        // headroom, so with the default cap (95% of free RAM) the first
+        // pinned allocation above the initial 100 MB pins ~0.8 TB on a
+        // GB200 node. HEONGPU_HOST_POOL_GB caps the pinned host pool.
+        if (const char* env = std::getenv("HEONGPU_HOST_POOL_GB"))
+        {
+            const double gb = std::atof(env);
+            if (gb > 0)
+            {
+                max_host_pool_size = std::min(
+                    max_host_pool_size,
+                    roundup_256(static_cast<size_t>(gb * (1ULL << 30))));
+                max_host_pool_size =
+                    std::max(max_host_pool_size, initial_host_pool_size);
+            }
+        }
 
         host_base_ = std::make_shared<HostResource>();
         host_pool_ = std::make_shared<HostPoolResource>(
@@ -174,6 +192,18 @@ size_t MemoryPool::get_current_host_pool_memory_usage() const
     std::lock_guard<std::mutex> guard(mutex_);
     auto host_status = host_stats_adaptor_->get_bytes_counter();
     return host_status.value;
+}
+
+size_t MemoryPool::get_peak_device_pool_memory_usage() const
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    return device_stats_adaptor_->get_bytes_counter().peak;
+}
+
+size_t MemoryPool::get_peak_host_pool_memory_usage() const
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    return host_stats_adaptor_->get_bytes_counter().peak;
 }
 
 size_t MemoryPool::get_free_host_pool_memory() const

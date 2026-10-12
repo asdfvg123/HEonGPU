@@ -36,6 +36,7 @@ namespace heongpu
         scheme_ = context.scheme_;
         coeff_modulus_count_ = context.Q_prime_size;
         ring_size_ = context.n; // n
+        n_power_ = context.n_power;
 
         hamming_weight_ = hamming_weight;
         if ((hamming_weight_ <= 0) || (hamming_weight_ > ring_size_))
@@ -158,6 +159,57 @@ namespace heongpu
         in_ntt_domain_ = true;
         storage_type_ = storage_type::DEVICE;
         secret_key_generated_ = true;
+    }
+
+    __host__ std::vector<int>
+    Secretkey<Scheme::RTF>::ternary(HEContext<Scheme::RTF>& context,
+                                    cudaStream_t stream)
+    {
+        if (!secret_key_generated_)
+            throw std::logic_error("Secretkey is not generated!");
+        if (!is_on_device())
+            store_in_device(stream);
+        // residue mod q0 (NTT form) -> coefficients mod q0 -> centred
+        DeviceVector<Data64> limb0(ring_size_, stream);
+        gpuntt::ntt_rns_configuration<Data64> cfg_intt = {
+            .n_power = n_power_,
+            .ntt_type = gpuntt::INVERSE,
+            .reduction_poly = gpuntt::ReductionPolynomial::X_N_plus,
+            .zero_padding = false,
+            .mod_inverse = context.n_inverse_->data(),
+            .stream = stream};
+        if (in_ntt_domain_)
+        {
+            gpuntt::GPU_NTT(device_locations_.data(), limb0.data(),
+                            context.intt_table_->data(),
+                            context.modulus_->data(), cfg_intt, 1, 1);
+        }
+        else
+        {
+            HEONGPU_CUDA_CHECK(cudaMemcpyAsync(
+                limb0.data(), device_locations_.data(),
+                ring_size_ * sizeof(Data64), cudaMemcpyDeviceToDevice, stream));
+        }
+        std::vector<Data64> host(ring_size_);
+        HEONGPU_CUDA_CHECK(cudaMemcpyAsync(host.data(), limb0.data(),
+                                           ring_size_ * sizeof(Data64),
+                                           cudaMemcpyDeviceToHost, stream));
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
+        const Data64 q0 = context.prime_vector_[0].value;
+        std::vector<int> out(ring_size_);
+        for (int i = 0; i < ring_size_; i++)
+        {
+            const Data64 v = host[i];
+            if (v == 0)
+                out[i] = 0;
+            else if (v == 1)
+                out[i] = 1;
+            else if (v == q0 - 1)
+                out[i] = -1;
+            else
+                throw std::logic_error("Secretkey::ternary: key is not ternary");
+        }
+        return out;
     }
 
     Data64* Secretkey<Scheme::RTF>::data()

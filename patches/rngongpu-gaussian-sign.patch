@@ -1,0 +1,162 @@
+diff --git a/src/rngongpu/lib/common/base_rng.cu b/src/rngongpu/lib/common/base_rng.cu
+index 5994a7b..fc85bf0 100644
+--- a/src/rngongpu/lib/common/base_rng.cu
++++ b/src/rngongpu/lib/common/base_rng.cu
+@@ -205,9 +205,18 @@ namespace rngongpu
+                 uint32_t flag1 =
+                     static_cast<uint32_t>(-static_cast<int32_t>(z1 < 0));
+ 
+-                pointer[2 * i] = static_cast<T>(z0) + (flag0 & modulus.value);
+-                pointer[2 * i + 1] =
+-                    static_cast<T>(z1) + (flag1 & modulus.value);
++                // A negative sample must land at q-|z|. Converting a negative
++                // float straight to an unsigned type clamps it to zero on the
++                // device, which turned every negative draw into 0 and left the
++                // error one-sided.
++                {
++                    long long i0 = (long long) rintf((float) z0);
++                    long long i1 = (long long) rintf((float) z1);
++                    T v0 = (T) (i0 < 0 ? -i0 : i0);
++                    T v1 = (T) (i1 < 0 ? -i1 : i1);
++                    pointer[2 * i] = (i0 < 0) ? (modulus.value - v0) : v0;
++                    pointer[2 * i + 1] = (i1 < 0) ? (modulus.value - v1) : v1;
++                }
+             }
+             else if constexpr (std::is_same_v<T, Data64>)
+             {
+@@ -216,9 +225,18 @@ namespace rngongpu
+                 uint64_t flag1 =
+                     static_cast<uint64_t>(-static_cast<int64_t>(z1 < 0));
+ 
+-                pointer[2 * i] = static_cast<T>(z0) + (flag0 & modulus.value);
+-                pointer[2 * i + 1] =
+-                    static_cast<T>(z1) + (flag1 & modulus.value);
++                // A negative sample must land at q-|z|. Converting a negative
++                // float straight to an unsigned type clamps it to zero on the
++                // device, which turned every negative draw into 0 and left the
++                // error one-sided.
++                {
++                    long long i0 = (long long) rintf((float) z0);
++                    long long i1 = (long long) rintf((float) z1);
++                    T v0 = (T) (i0 < 0 ? -i0 : i0);
++                    T v1 = (T) (i1 < 0 ? -i1 : i1);
++                    pointer[2 * i] = (i0 < 0) ? (modulus.value - v0) : v0;
++                    pointer[2 * i + 1] = (i1 < 0) ? (modulus.value - v1) : v1;
++                }
+             }
+         }
+     }
+@@ -273,10 +291,16 @@ namespace rngongpu
+                     for (int k = 0; k < mod_count; k++)
+                     {
+                         int in_offset = k << log_size;
+-                        output[global_index + in_offset] =
+-                            static_cast<T>(z0) + (flag0 & modulus[k].value);
+-                        output[global_index + 1 + in_offset] =
+-                            static_cast<T>(z1) + (flag1 & modulus[k].value);
++                        {
++                            long long i0 = (long long) rintf((float) z0);
++                            long long i1 = (long long) rintf((float) z1);
++                            T v0 = (T) (i0 < 0 ? -i0 : i0);
++                            T v1 = (T) (i1 < 0 ? -i1 : i1);
++                            output[global_index + in_offset] =
++                                (i0 < 0) ? (modulus[k].value - v0) : v0;
++                            output[global_index + 1 + in_offset] =
++                                (i1 < 0) ? (modulus[k].value - v1) : v1;
++                        }
+                     }
+                 }
+                 else if constexpr (std::is_same_v<T, Data64>)
+@@ -290,10 +314,16 @@ namespace rngongpu
+                     for (int k = 0; k < mod_count; k++)
+                     {
+                         int in_offset = k << log_size;
+-                        output[global_index + in_offset] =
+-                            static_cast<T>(z0) + (flag0 & modulus[k].value);
+-                        output[global_index + 1 + in_offset] =
+-                            static_cast<T>(z1) + (flag1 & modulus[k].value);
++                        {
++                            long long i0 = (long long) rintf((float) z0);
++                            long long i1 = (long long) rintf((float) z1);
++                            T v0 = (T) (i0 < 0 ? -i0 : i0);
++                            T v1 = (T) (i1 < 0 ? -i1 : i1);
++                            output[global_index + in_offset] =
++                                (i0 < 0) ? (modulus[k].value - v0) : v0;
++                            output[global_index + 1 + in_offset] =
++                                (i1 < 0) ? (modulus[k].value - v1) : v1;
++                        }
+                     }
+                 }
+             }
+@@ -327,8 +357,13 @@ namespace rngongpu
+             {
+                 int global_index = offset + (2 * i);
+ 
+-                U u1 = static_cast<U>(input[2 * global_index]) / max_value;
+-                U u2 = static_cast<U>(input[2 * global_index + 1]) / max_value;
++                // The scratch holds size_wo_repeat entries per repeat, one per
++                // coefficient; the output holds mod_count times that. Index the
++                // scratch by the coefficient, not by the output slot.
++                int in_index = j * size_wo_repeat + (2 * i);
++
++                U u1 = static_cast<U>(input[in_index]) / max_value;
++                U u2 = static_cast<U>(input[in_index + 1]) / max_value;
+ 
+                 U radius = sqrt(-static_cast<U>(2.0) * log(u1));
+                 U theta = static_cast<U>(2.0) * static_cast<U>(M_PI) * u2;
+@@ -336,6 +371,9 @@ namespace rngongpu
+                 U z0 = radius * cos(theta);
+                 U z1 = radius * sin(theta);
+ 
++                z0 = z0 * std_dev;
++                z1 = z1 * std_dev;
++
+                 if constexpr (std::is_same_v<T, Data32>)
+                 {
+                     uint32_t flag0 =
+@@ -348,12 +386,16 @@ namespace rngongpu
+                     {
+                         int new_index = mod_index[k];
+                         int in_offset = k << log_size;
+-                        output[global_index + in_offset] =
+-                            static_cast<T>(z0) +
+-                            (flag0 & modulus[new_index].value);
+-                        output[global_index + 1 + in_offset] =
+-                            static_cast<T>(z1) +
+-                            (flag1 & modulus[new_index].value);
++                        {
++                            long long i0 = (long long) rintf((float) z0);
++                            long long i1 = (long long) rintf((float) z1);
++                            T v0 = (T) (i0 < 0 ? -i0 : i0);
++                            T v1 = (T) (i1 < 0 ? -i1 : i1);
++                            output[global_index + in_offset] =
++                                (i0 < 0) ? (modulus[new_index].value - v0) : v0;
++                            output[global_index + 1 + in_offset] =
++                                (i1 < 0) ? (modulus[new_index].value - v1) : v1;
++                        }
+                     }
+                 }
+                 else if constexpr (std::is_same_v<T, Data64>)
+@@ -368,12 +410,16 @@ namespace rngongpu
+                     {
+                         int new_index = mod_index[k];
+                         int in_offset = k << log_size;
+-                        output[global_index + in_offset] =
+-                            static_cast<T>(z0) +
+-                            (flag0 & modulus[new_index].value);
+-                        output[global_index + 1 + in_offset] =
+-                            static_cast<T>(z1) +
+-                            (flag1 & modulus[new_index].value);
++                        {
++                            long long i0 = (long long) rintf((float) z0);
++                            long long i1 = (long long) rintf((float) z1);
++                            T v0 = (T) (i0 < 0 ? -i0 : i0);
++                            T v1 = (T) (i1 < 0 ? -i1 : i1);
++                            output[global_index + in_offset] =
++                                (i0 < 0) ? (modulus[new_index].value - v0) : v0;
++                            output[global_index + 1 + in_offset] =
++                                (i1 < 0) ? (modulus[new_index].value - v1) : v1;
++                        }
+                     }
+                 }
+             }

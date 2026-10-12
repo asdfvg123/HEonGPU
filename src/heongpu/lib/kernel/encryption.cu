@@ -73,8 +73,11 @@ namespace heongpu
             fix = int(fix / plain_mod.value);
 
             Data64 ct_0 = OPERATOR_GPU_64::mult(
-                message, coeffdiv_plain[block_y], modulus[block_y]);
-            ct_0 = OPERATOR_GPU_64::add(ct_0, fix, modulus[block_y]);
+                OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),
+                coeffdiv_plain[block_y], modulus[block_y]);
+            ct_0 = OPERATOR_GPU_64::add(
+                ct_0, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
             input_ = OPERATOR_GPU_64::add(input_, ct_0, modulus[block_y]);
 
@@ -163,8 +166,11 @@ namespace heongpu
             fix = int(fix / plain_mod.value);
 
             Data64 ct_0 = OPERATOR_GPU_64::mult(
-                message, coeffdiv_plain[block_y], modulus[block_y]);
-            ct_0 = OPERATOR_GPU_64::add(ct_0, fix, modulus[block_y]);
+                OPERATOR_GPU_64::reduce_forced(message, modulus[block_y]),
+                coeffdiv_plain[block_y], modulus[block_y]);
+            ct_0 = OPERATOR_GPU_64::add(
+                ct_0, OPERATOR_GPU_64::reduce_forced(fix, modulus[block_y]),
+                modulus[block_y]);
 
             input_ = OPERATOR_GPU_64::add(input_, ct_0, modulus[block_y]);
 
