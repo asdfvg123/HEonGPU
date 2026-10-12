@@ -24,6 +24,7 @@ set(EXECUTABLES
     18_rtf_moddown 18_rtf_moddown.cu
     19_rtf_rubato 19_rtf_rubato.cu
     20_rtf_s2c_fft 20_rtf_s2c_fft.cu
+    21_rtf_hera 21_rtf_hera.cu
 )
 
 function(add_example exe source)

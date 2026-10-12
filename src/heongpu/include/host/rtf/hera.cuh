@@ -19,7 +19,9 @@
 #include "rtf/operator.cuh"
 #include "rtf/secretkey.cuh"
 #include "rtf/rubato.h"
+#include "rtf/hera_ref.h"
 #include <future>
+#include <functional>
 #include "rtf/slot_lintrans.cuh"
 #include "rtf/s2c_fft.cuh"
 
@@ -29,6 +31,13 @@
 
 namespace heongpu
 {
+    // Stream cipher that HEHERA evaluates: Rubato Par-128L (64-word blocks,
+    // the default) or HERA Par-128a (16-word blocks).
+    enum class StreamCipher
+    {
+        Rubato,
+        Hera
+    };
 
     /**
      * @brief HERA is responsible for generating FV encrypted stream key
@@ -48,7 +57,8 @@ namespace heongpu
                         HEOperator<Scheme::RTF>& op,
                         Galoiskey<Scheme::RTF>& galois_key,
                         Relinkey<Scheme::RTF>& relin_key,
-                        const ExecutionOptions& options = ExecutionOptions()
+                        const ExecutionOptions& options = ExecutionOptions(),
+                        StreamCipher cipher = StreamCipher::Rubato
                         );
 
         __host__ void set_galois_key_bs(Galoiskey<Scheme::RTF>& galois_key_bs){
@@ -112,11 +122,30 @@ namespace heongpu
             const ExecutionOptions& options = ExecutionOptions()
         );
 
+        // output = input^3 (two multiplications, each relinearized).
         __host__ void cube(
             Ciphertext<Scheme::RTF>& input,
             Ciphertext<Scheme::RTF>& output,
             const ExecutionOptions& options = ExecutionOptions()
         );
+
+        // HERA with FV modulus switching between rounds (the reference's
+        // CipherModDown). stages has r + 1 entries: stage i < r runs ARK_i,
+        // MixRows o MixColumns and Cube, stage r the final MixRows o
+        // MixColumns and ARK_r; the state is switched to the next stage's
+        // context in between (its moduli must be a prefix). keys[i] is the
+        // encrypted key at stage i's level. A stage may repeat (no switch).
+        // Each stage needs the round constants of its rounds
+        // (set_round_constants_staged), Galois keys for
+        // rubato_rotation_shifts(), and stages 0..r-1 a relinearization key.
+        // probe(i, state), if set, is called after round i's Cube and mod
+        // switch (i < r) and on the output (i = r), e.g. for noise budgets.
+        static __host__ Ciphertext<Scheme::RTF> gen_stream_key_staged(
+            const std::vector<HEHERA*>& stages,
+            const std::vector<Ciphertext<Scheme::RTF>*>& keys,
+            const ExecutionOptions& options = ExecutionOptions(),
+            const std::function<void(int, Ciphertext<Scheme::RTF>&)>& probe =
+                nullptr);
 
         // MixRows o MixColumns on every 64-slot block. With truncate = true
         // the rows of the last n - l words are zero (Tr_{n,l} of the final
@@ -154,9 +183,17 @@ namespace heongpu
             const std::array<uint8_t, 8>& nonce, uint64_t counter_start = 0,
             int max_threads = 0) const;
 
-        // GPU part of set_nonce: encodes the round constants as FV plaintexts.
+        // GPU part of set_nonce: encodes the round constants as FV plaintexts
+        // (only the listed rounds if `rounds` is not empty).
         __host__ void set_round_constants(
             const RoundConstants& rc,
+            const ExecutionOptions& options = ExecutionOptions(),
+            const std::vector<int>& rounds = {});
+
+        // set_round_constants for gen_stream_key_staged: each stage encodes
+        // the rounds it runs (stage i: round i).
+        static __host__ void set_round_constants_staged(
+            const std::vector<HEHERA*>& stages, const RoundConstants& rc,
             const ExecutionOptions& options = ExecutionOptions());
 
         // Same with one 16-byte XOF seed per block.
@@ -168,6 +205,12 @@ namespace heongpu
         __host__ const rubato::Params& get_rubato_params() const noexcept {
             return rubato_params_;
         }
+        __host__ StreamCipher get_cipher() const noexcept { return cipher_; }
+        // Words per cipher block (64 Rubato, 16 HERA), keystream words per
+        // block (60 Rubato after truncation, 16 HERA), number of rounds.
+        __host__ int get_block_size() const noexcept { return block_; }
+        __host__ int get_output_words() const noexcept { return l_; }
+        __host__ int get_rounds() const noexcept { return round_; }
 
         // Client-side message scaling Delta: c = round(Delta * m) + z mod q.
         __host__ double get_message_scaling() const noexcept {
@@ -203,12 +246,12 @@ namespace heongpu
         }
 
         // Row rotations whose Galois keys gen_stream_key needs (linear layers
-        // by baby-step/giant-step, plus -1 for the Feistel layer).
+        // by baby-step/giant-step, plus -1 for Rubato's Feistel layer).
         __host__ std::vector<int> rubato_rotation_shifts() const;
 
-        // Number of 64-word Rubato blocks packed in one FV ciphertext.
+        // Number of cipher blocks packed in one FV ciphertext.
         __host__ int get_block_count() const noexcept {
-            return n / rubato_params_.n;
+            return n / block_;
         }
         
         __host__ Ciphertext<Scheme::RTF> S2C_FV(
@@ -596,6 +639,10 @@ namespace heongpu
 
         // Rubato (Par-128L)
         rubato::Params rubato_params_ = rubato::Par128L;
+        hera::Params hera_params_ = hera::Par128a;
+        StreamCipher cipher_ = StreamCipher::Rubato;
+        int block_ = rubato::Par128L.n;
+        int l_ = rubato::Par128L.l;
         int round_ = rubato::Par128L.rounds;
         bool rc_ready_ = false;
         std::shared_ptr<FVSlotToCoeffFFT> s2c_fft_;

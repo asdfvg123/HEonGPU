@@ -1,6 +1,7 @@
 
 #include "rtf/hera.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <future>
 #include <sched.h>
@@ -18,7 +19,8 @@ namespace heongpu
                                 HEOperator<Scheme::RTF>& op,
                                 Galoiskey<Scheme::RTF>& galois_key,
                                 Relinkey<Scheme::RTF>& relin_key,
-                                const ExecutionOptions& options
+                                const ExecutionOptions& options,
+                                StreamCipher cipher
                             )
         : 
         contextbfv_(context), 
@@ -192,18 +194,23 @@ namespace heongpu
         plain_psi_ = context.plain_psi_;
         messageScaling_ = plain_modulus_.value / message_ratio_;
         
-        const int block = rubato_params_.n;
+        cipher_ = cipher;
+        const bool is_hera = (cipher_ == StreamCipher::Hera);
+        block_ = is_hera ? hera_params_.n : rubato_params_.n;
+        l_ = is_hera ? hera_params_.n : rubato_params_.l;
+        const int block = block_;
         if (n % block != 0 || (n >> 1) % block != 0)
         {
             throw std::invalid_argument(
-                "HEHERA: N/2 must be a multiple of the Rubato block size.");
+                "HEHERA: N/2 must be a multiple of the cipher block size.");
         }
-        if (plain_modulus_.value != rubato_params_.q)
+        if (plain_modulus_.value !=
+            (is_hera ? hera_params_.q : rubato_params_.q))
         {
             throw std::invalid_argument(
-                "HEHERA: plain modulus must be the Rubato modulus q.");
+                "HEHERA: plain modulus must be the cipher modulus q.");
         }
-        round_ = rubato_params_.rounds;
+        round_ = is_hera ? hera_params_.rounds : rubato_params_.rounds;
         rc_vec_size_ = static_cast<size_t>(round_ + 1) * n;
         // ic = (1, 2, ..., n) in every block
         icVec.resize(n);
@@ -226,21 +233,21 @@ namespace heongpu
         const size_t blocks_per_row = row_len / B;
 
         
-        std::vector<uint64_t> feistel_mask(n);
-        for (size_t i = 0; i < n; ++i)
+        if (!is_hera)
         {
-            if (i % B == 0){
-                feistel_mask[i] = 0;
-            } else {
-                feistel_mask[i] = 1;
-            }
-        }        
-        encoder_.encode(feistel_maskPt_, feistel_mask, options);
+            std::vector<uint64_t> feistel_mask(n);
+            for (size_t i = 0; i < n; ++i)
+                feistel_mask[i] = (i % B == 0) ? 0 : 1;
+            encoder_.encode(feistel_maskPt_, feistel_mask, options);
+        }
 
 
-        // MixRows o MixColumns = M64 = M8 (x) M8 on every 64-slot block, as a
-        // slot-domain transform with diagonals at rotations -63..63.
-        // rows_kept = l zeroes the truncated output words (Tr_{n,l}).
+        // MixRows o MixColumns = M8 (x) M8 on every 64-slot Rubato block
+        // (M4 (x) M4 on every 16-slot HERA block), as a slot-domain transform
+        // with diagonals at rotations -(B-1)..B-1. rows_kept = l zeroes the
+        // truncated output words (Tr_{n,l}, Rubato only).
+        auto entry = [&](int r, int c) -> uint64_t
+        { return is_hera ? hera::linear_entry(r, c) : M64[r][c]; };
         auto build_diagonals = [&](int rows_kept)
         {
             SlotLinearTransform::DiagMap diags;
@@ -257,7 +264,7 @@ namespace heongpu
                             const int c = r + rot;
                             if (c >= 0 && c < (int) B)
                             {
-                                d[base + r] = M64[r][c];
+                                d[base + r] = entry(r, c);
                                 nonzero = true;
                             }
                         }
@@ -273,9 +280,10 @@ namespace heongpu
         linear_full_ = SlotLinearTransform(context, encoder, op,
                                            build_diagonals((int) B), options,
                                            base_rot);
-        linear_trunc_ = SlotLinearTransform(
-            context, encoder, op, build_diagonals(rubato_params_.l), options,
-            base_rot);
+        if (!is_hera)
+            linear_trunc_ = SlotLinearTransform(
+                context, encoder, op, build_diagonals(rubato_params_.l),
+                options, base_rot);
         HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     }
@@ -308,6 +316,12 @@ namespace heongpu
         Ciphertext<Scheme::RTF>& key,
         const ExecutionOptions& options)
     {
+        if (cipher_ == StreamCipher::Hera)
+        {
+            std::vector<HEHERA*> stages(round_ + 1, this);
+            std::vector<Ciphertext<Scheme::RTF>*> keys(round_ + 1, &key);
+            return gen_stream_key_staged(stages, keys, options);
+        }
         Ciphertext<Scheme::RTF> result(contextbfv_);
         precompute(key, options);
 
@@ -379,11 +393,13 @@ namespace heongpu
     {
         cudaStream_t stream = options.stream_;
         if (stream == cudaStreamDefault) stream = input.stream();
-            
-        operator_.multiply_inplace(input, input, options);
-        operator_.relinearize_inplace(input, relin_key_, options);
-        operator_.multiply(input, input, output, options);
-        operator_.relinearize_inplace(output, relin_key_, options);
+
+        Ciphertext<Scheme::RTF> sq(contextbfv_);
+        operator_.multiply(input, input, sq, options);
+        operator_.relinearize_inplace(sq, relin_key_, options);
+        operator_.multiply(sq, input, sq, options);
+        operator_.relinearize_inplace(sq, relin_key_, options);
+        output = std::move(sq);
 
         HEONGPU_CUDA_CHECK(cudaGetLastError());
         HEONGPU_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -414,7 +430,9 @@ namespace heongpu
             operator_.transform_from_ntt_inplace(x, opt);
         }
 
-        const SlotLinearTransform& lt = truncate ? linear_trunc_ : linear_full_;
+        const SlotLinearTransform& lt =
+            (truncate && cipher_ == StreamCipher::Rubato) ? linear_trunc_
+                                                          : linear_full_;
         auto y = lt.apply(operator_, contextbfv_, x, galois_key_hera_, opt);
         output = y;
         HEONGPU_CUDA_CHECK(cudaGetLastError());
@@ -440,11 +458,15 @@ namespace heongpu
     __host__ std::vector<int>
     heongpu::HEHERA<heongpu::Scheme::RTF>::rubato_rotation_shifts() const
     {
-        std::set<int> s = {-1};
+        std::set<int> s;
         for (int v : linear_full_.rotation_shifts())
             s.insert(v);
-        for (int v : linear_trunc_.rotation_shifts())
-            s.insert(v);
+        if (cipher_ == StreamCipher::Rubato)
+        {
+            s.insert(-1); // Feistel
+            for (int v : linear_trunc_.rotation_shifts())
+                s.insert(v);
+        }
         return std::vector<int>(s.begin(), s.end());
     }
 
@@ -478,8 +500,9 @@ namespace heongpu
     heongpu::HEHERA<heongpu::Scheme::RTF>::compute_round_constants(
         const std::vector<std::vector<uint8_t>>& seeds, int max_threads) const
     {
-        const int block = rubato_params_.n;
+        const int block = block_;
         const int blocks = get_block_count();
+        const bool is_hera = (cipher_ == StreamCipher::Hera);
         if ((int) seeds.size() != blocks)
         {
             throw std::invalid_argument(
@@ -493,12 +516,15 @@ namespace heongpu
         {
             for (int j = j0; j < j1; ++j)
             {
-                auto rc = rubato::round_constants(seeds[j], rubato_params_);
+                auto rc = is_hera
+                              ? hera::round_constants(seeds[j], hera_params_)
+                              : rubato::round_constants(seeds[j],
+                                                        rubato_params_);
                 for (int r = 0; r <= round_; ++r)
                     for (int i = 0; i < block; ++i)
                         rc_all[r][j * block + i] = rc[r][i];
                 // Tr_{n,l} o ARK: the truncated words get no round key.
-                for (int i = rubato_params_.l; i < block; ++i)
+                for (int i = l_; i < block; ++i)
                     rc_all[round_][j * block + i] = 0;
             }
         };
@@ -546,21 +572,100 @@ namespace heongpu
     }
 
     __host__ void heongpu::HEHERA<heongpu::Scheme::RTF>::set_round_constants(
-        const RoundConstants& rc, const ExecutionOptions& options)
+        const RoundConstants& rc, const ExecutionOptions& options,
+        const std::vector<int>& rounds)
     {
         if ((int) rc.size() != round_ + 1)
             throw std::invalid_argument("HEHERA::set_round_constants: rounds");
         rcVec = rc;
-        rcPt.clear();
-        rcPt.reserve(round_ + 1);
+        rcPt.resize(round_ + 1);
         for (int r = 0; r < round_ + 1; ++r)
         {
+            if (!rounds.empty() &&
+                std::find(rounds.begin(), rounds.end(), r) == rounds.end())
+                continue;
             Plaintext<Scheme::RTF> pt(contextbfv_);
             encoder_.encode(pt, rcVec[r], options);
             pt.store_in_device(options.stream_);
-            rcPt.emplace_back(std::move(pt));
+            rcPt[r] = std::move(pt);
         }
         rc_ready_ = true;
+    }
+
+    __host__ void
+    heongpu::HEHERA<heongpu::Scheme::RTF>::set_round_constants_staged(
+        const std::vector<HEHERA*>& stages, const RoundConstants& rc,
+        const ExecutionOptions& options)
+    {
+        // Rounds of each distinct stage object.
+        std::vector<std::pair<HEHERA*, std::vector<int>>> own;
+        for (int i = 0; i < (int) stages.size(); ++i)
+        {
+            auto it = std::find_if(own.begin(), own.end(),
+                                   [&](auto& p) { return p.first == stages[i]; });
+            if (it == own.end())
+                own.push_back({stages[i], {i}});
+            else
+                it->second.push_back(i);
+        }
+        for (auto& [st, rounds] : own)
+            st->set_round_constants(rc, options, rounds);
+    }
+
+    __host__ Ciphertext<Scheme::RTF>
+    heongpu::HEHERA<heongpu::Scheme::RTF>::gen_stream_key_staged(
+        const std::vector<HEHERA*>& stages,
+        const std::vector<Ciphertext<Scheme::RTF>*>& keys,
+        const ExecutionOptions& options,
+        const std::function<void(int, Ciphertext<Scheme::RTF>&)>& probe)
+    {
+        if (stages.empty() || stages[0]->cipher_ != StreamCipher::Hera ||
+            (int) stages.size() != stages[0]->round_ + 1 ||
+            keys.size() != stages.size())
+            throw std::invalid_argument(
+                "gen_stream_key_staged: need r + 1 HERA stages and keys");
+        for (auto* st : stages)
+            if (!st->rc_ready_)
+                throw std::logic_error(
+                    "HEHERA: round constants not set; call set_nonce first.");
+        const int r_last = (int) stages.size() - 1;
+        auto opt = ExecutionOptions()
+                       .set_stream(options.stream_)
+                       .set_storage_type(storage_type::DEVICE)
+                       .set_initial_location(true);
+
+        // ARK_i on stage i: state += k . rc_i
+        auto ark = [&](Ciphertext<Scheme::RTF>& state, int i)
+        {
+            HEHERA& S = *stages[i];
+            Ciphertext<Scheme::RTF> rk(S.contextbfv_);
+            S.operator_.multiply_plain(*keys[i], S.rcPt[i], rk, opt);
+            S.operator_.add_inplace(state, rk, opt);
+        };
+
+        // ARK_0(ic) = ic + k . rc_0 (ic as a plaintext)
+        Ciphertext<Scheme::RTF> st(stages[0]->contextbfv_);
+        stages[0]->operator_.multiply_plain(*keys[0], stages[0]->rcPt[0], st,
+                                            opt);
+        stages[0]->operator_.add_plain_inplace(st, stages[0]->icPt_, opt);
+        for (int i = 0; i < r_last; ++i)
+        {
+            HEHERA& S = *stages[i];
+            S.linear(st, st, opt);
+            S.cube(st, st, opt);
+            if (stages[i + 1] != stages[i])
+                st = S.mod_switch_to(st, stages[i + 1]->contextbfv_, opt);
+            if (probe)
+                probe(i, st);
+            if (i + 1 < r_last)
+                ark(st, i + 1);
+        }
+        stages[r_last]->linear(st, st, opt);
+        ark(st, r_last);
+        if (probe)
+            probe(r_last, st);
+        HEONGPU_CUDA_CHECK(cudaStreamSynchronize(options.stream_));
+        return st;
     }
 
     static inline void rotate_subrange_right_inplace(std::vector<uint64_t>& v,
