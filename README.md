@@ -9,13 +9,13 @@ For more information about RtF:
 
 ### Execution times of the RtF flow
 
-| HHE Scheme             | logN | l | r | logQP | logDelta_CKKS | Offline Latency [s] | Online Latency [ms]  | Throughput [KB/s]  |
-|:----------------------:|:----:|:-:|:-:|:-----:|:-------------:|:---------------:|:---------------:|:-----------:|
-| **HERA Par-128**       | 16   | 16| 5 | 1533  | 50            |    11.2         |   485              |   17.1          |
-| **Rubato Par-128L**    | 16   | 60| 2 | 1533  | 50            |    13.7         |   491              |   14.1          |
+| HHE Scheme | GPU | logN | l | r | logQP | logDelta_CKKS | Offline Latency [ms] | Online Latency [ms] | Throughput [KB/s] |
+|:----------:|:---:|:----:|:-:|:-:|:-----:|:-------------:|:--------------------:|:-------------------:|:-----------------:|
+| **Rubato Par-128L** (`dev`) | GB200 | 16 | 60 | 2 | 1532 | 45 | **26.4** | **79.1** | **1,896** |
+| HERA Par-128 (previous) | H100 | 16 | 16 | 5 | 1533 | 50 | 11,200 | 485 | 17.1 |
+| Rubato Par-128L (previous) | H100 | 16 | 60 | 2 | 1533 | 50 | 13,700 | 491 | 14.1 |
 
-</div>
-All experiments are conducted with H100. 
+</div> 
 
 
 
