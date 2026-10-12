@@ -2152,6 +2152,9 @@ namespace heongpu
                       const Polynomial& pol, Relinkey<Scheme::CKKS>& relin_key,
                       const ExecutionOptions& options);
 
+        // round(value) modulo the first `limbs` primes, exactly.
+        __host__ RnsConstant rns_constant(double value, int limbs);
+
         __host__ Ciphertext<Scheme::CKKS> evaluate_poly_from_polynomial_basis(
             double target_scale, int target_level, const Polynomial& pol,
             std::unordered_map<int, Ciphertext<Scheme::CKKS>>& powered_ciphers,

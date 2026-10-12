@@ -147,5 +147,20 @@ namespace heongpu
         Data64* in1, Data64* real_rns, Data64* imag_rns, Data64* accumulator,
         Data64* ntt_table, Modulus64* modulus, int n_power);
 
+    // One constant per RNS limb, passed by value so that launching needs no
+    // host-to-device copy.
+    struct RnsConstant
+    {
+        static constexpr int kMaxLimbs = 64;
+        Data64 value[kMaxLimbs];
+    };
+
+    // acc[p][l] += in[p][l] * c[l] for l < gridDim.y, p < gridDim.z, on NTT
+    // form ciphertexts. in may have more limbs than acc (in_limbs >= acc_limbs),
+    // which drops its extra limbs like mod_drop.
+    __global__ void cipher_mult_rns_constant_accumulate_kernel(
+        const Data64* in, int in_limbs, Data64* acc, int acc_limbs,
+        RnsConstant c, Modulus64* modulus, int n_power);
+
 } // namespace heongpu
 #endif // HEONGPU_MULTIPLICATION_H

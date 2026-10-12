@@ -281,6 +281,9 @@ namespace heongpu
         for (int main_lp = 0; main_lp < level_Q_.size(); main_lp++)
         {
             std::vector<Data64> all_base_matrix_inner;
+            // Shoup companions floor(w * 2^64 / q), appended after the
+            // matrix (base_conversion_DtoQtilde_relin_leveled_kernel).
+            std::vector<Data64> shoup_inner;
             int index = 0;
             for (int l = 0; l < level_d_[main_lp]; l++)
             {
@@ -300,10 +303,17 @@ namespace heongpu
                             }
                         }
                         all_base_matrix_inner.push_back(temp);
+                        shoup_inner.push_back(static_cast<Data64>(
+                            (static_cast<unsigned __int128>(temp) << 64) /
+                            obase[k].value));
                     }
                 }
                 index = index + level_d_vector_[main_lp][l];
             }
+
+            all_base_matrix_inner.insert(all_base_matrix_inner.end(),
+                                         shoup_inner.begin(),
+                                         shoup_inner.end());
 
             ibase.erase(ibase.begin() + elementToRemove);
             obase.erase(obase.begin() + elementToRemove);

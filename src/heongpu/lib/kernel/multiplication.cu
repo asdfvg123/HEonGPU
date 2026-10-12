@@ -789,4 +789,19 @@ namespace heongpu
             OPERATOR_GPU_64::add(acc, mult_result, modulus[block_y]);
     }
 
+    __global__ void cipher_mult_rns_constant_accumulate_kernel(
+        const Data64* in, int in_limbs, Data64* acc, int acc_limbs,
+        RnsConstant c, Modulus64* modulus, int n_power)
+    {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x; // ring size
+        int limb = blockIdx.y; // rns count
+        int poly = blockIdx.z; // cipher count
+
+        Data64 x = in[idx + ((poly * in_limbs + limb) << n_power)];
+        int location_acc = idx + ((poly * acc_limbs + limb) << n_power);
+        Data64 prod = OPERATOR_GPU_64::mult(x, c.value[limb], modulus[limb]);
+        acc[location_acc] =
+            OPERATOR_GPU_64::add(acc[location_acc], prod, modulus[limb]);
+    }
+
 } // namespace heongpu
